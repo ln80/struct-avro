@@ -1,0 +1,164 @@
+package avro
+
+import (
+	"fmt"
+	"reflect"
+
+	avro "github.com/ln80/avro/v2"
+)
+
+// RecordEntry describes one record (e.g. an event type) to embed in an envelope union.
+type RecordEntry struct {
+	// Name is the record's full (dotted) schema name, e.g. "bank.AccountOpened".
+	Name string
+	// Type is the Go struct type of the record.
+	Type reflect.Type
+	// Sample is a value of Type used to derive AVRO defaults (typically the zero
+	// value or a registry-provided default). May be nil.
+	Sample any
+	// Aliases are record-name aliases declared at the registry level (struct-level
+	// aliases via the blank "_" field are resolved automatically).
+	Aliases []string
+}
+
+// EnvelopeConfig configures BuildEnvelopeSchema.
+type EnvelopeConfig struct {
+	// Namespace of the generated schemas. If empty, RootNamespace defaults to "_".
+	Namespace string
+	// RootType is the Go struct type of the envelope (e.g. the event envelope).
+	RootType reflect.Type
+	// RootName forces the envelope record name (e.g. "events").
+	RootName string
+	// InjectKey is the `ev:",inject=<key>"` key on the envelope field that receives
+	// the union of record schemas.
+	InjectKey string
+	// Entries are the records to include in the union.
+	Entries []RecordEntry
+	// TagKey overrides the schema-option tag key (default "ev").
+	TagKey string
+	// Validate, when true, round-trips each record's defaults through the API to
+	// catch invalid generated defaults (mirrors event-store's eventSchema checks).
+	Validate bool
+}
+
+// BuildEnvelopeSchema assembles an envelope record schema: it generates one record
+// schema per entry (sharing a dedup cache and a fingerprint accumulator), wraps them
+// in a [null, ...records] union, and injects that union into the envelope RootType.
+//
+// It is a generic, event-store-independent reimplementation of event-store's
+// eventSchema; callers supply the entries (e.g. from their own event registry).
+func BuildEnvelopeSchema(a avro.API, cfg EnvelopeConfig) (*avro.RecordSchema, error) {
+	if len(cfg.Entries) == 0 {
+		return nil, fmt.Errorf("no record entries provided")
+	}
+	tagKey := cfg.TagKey
+	if tagKey == "" {
+		tagKey = DefaultTagKey
+	}
+
+	cache := NewCache()
+	acc := NewAccumulator()
+
+	schemas := make([]avro.Schema, 0, len(cfg.Entries)+1)
+	for _, entry := range cfg.Entries {
+		def, err := defaultOf(entry.Sample)
+		if err != nil {
+			return nil, err
+		}
+
+		// aliases can be defined at the registry level as well as at the struct level
+		// (via the blank "_" field tag).
+		aliases := append([]string{}, entry.Aliases...)
+		aliases = structTypeAliases(tagKey, entry.Type, aliases)
+		aliases = unique(aliases)
+
+		schema, err := schemaOf(entry.Type, func(sc *Config) {
+			sc.name = entry.Name
+			sc.namespace = cfg.Namespace
+			sc.def = def
+			sc.aliases = aliases
+			sc.cache = cache
+			sc.isEvent = true
+			sc.acc = acc
+			sc.tagKey = tagKey
+		})
+		if err != nil {
+			return nil, fmt.Errorf("record '%s': %w", entry.Name, err)
+		}
+
+		if cfg.Validate {
+			data, err := a.Marshal(schema, map[string]any{})
+			if err != nil {
+				return nil, fmt.Errorf("record '%s' invalid generated defaults: %w", entry.Name, err)
+			}
+			data2, err := a.Marshal(schema, entry.Sample)
+			if err != nil {
+				return nil, fmt.Errorf("record '%s' invalid generated schema: %w", entry.Name, err)
+			}
+			if !reflect.DeepEqual(data, data2) {
+				return nil, fmt.Errorf("record '%s': invalid generated defaults", entry.Name)
+			}
+		}
+
+		schemas = append(schemas, schema)
+	}
+
+	schemas = append([]avro.Schema{avro.NewPrimitiveSchema(avro.Null, nil)}, schemas...)
+
+	unionSch, err := avro.NewUnionSchema(schemas)
+	if err != nil {
+		return nil, err
+	}
+
+	rootNS := cfg.Namespace
+	if rootNS == "" {
+		rootNS = "_"
+	}
+
+	sc, err := schemaOf(cfg.RootType, func(c *Config) {
+		c.inject = map[string]avro.Schema{cfg.InjectKey: unionSch}
+		c.namespace = rootNS
+		c.name = cfg.RootName
+		c.root = true
+		c.acc = acc
+		c.tagKey = tagKey
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	root, ok := sc.(*avro.RecordSchema)
+	if !ok {
+		return nil, fmt.Errorf("envelope schema type must be a record, got %T", sc)
+	}
+
+	return root, nil
+}
+
+// UnpackUnionRecords returns the record sub-schemas wrapped in the named union field
+// of an envelope record (skipping the null branch). It is the inverse of the union
+// embedding done by BuildEnvelopeSchema.
+func UnpackUnionRecords(schema *avro.RecordSchema, fieldName string) ([]*avro.RecordSchema, error) {
+	schemas := make([]*avro.RecordSchema, 0)
+	for _, f := range schema.Fields() {
+		if f.Name() != fieldName {
+			continue
+		}
+		sc, ok := f.Type().(*avro.UnionSchema)
+		if !ok {
+			return nil, fmt.Errorf("field '%s' must be a union, got %T", fieldName, f.Type())
+		}
+		for _, t := range sc.Types() {
+			if t.Type() == avro.Null {
+				continue
+			}
+			tt, ok := t.(*avro.RecordSchema)
+			if !ok {
+				return nil, fmt.Errorf("union member must be a record, got %T", t)
+			}
+			schemas = append(schemas, tt)
+		}
+	}
+
+	return schemas, nil
+}
