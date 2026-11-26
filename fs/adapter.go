@@ -231,7 +231,7 @@ func sameSchemaFile(path string, b []byte) (bool, error) {
 // once: an existing file means another writer took that version, and is never
 // overwritten. On a failed write the partial file is removed.
 func writeNewFile(path string, b []byte) (err error) {
-	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o640) // #nosec G304 -- path is built from a validated version and ID under the adapter dir
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644) // #nosec G302 G304 -- schemas are committed source, not secrets; path is built from a validated version and ID under the adapter dir
 	if err != nil {
 		return err
 	}

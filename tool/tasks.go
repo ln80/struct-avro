@@ -12,17 +12,21 @@ import (
 	"bytes"
 	"context"
 	_ "embed"
+	"encoding/json"
 	"errors"
 	"fmt"
-	"go/format"
-	"html/template"
+	"go/token"
+	"path"
+	"path/filepath"
 	"runtime/debug"
 	"sort"
 	"strings"
+	"text/template"
 
 	_avro "github.com/ln80/avro/v2"
 	"github.com/ln80/avro/v2/gen"
 	stravro "github.com/ln80/struct-avro"
+	"github.com/ln80/struct-avro/fs"
 	"github.com/ln80/struct-avro/registry"
 	internal "github.com/ln80/struct-avro/tool/internal"
 )
@@ -73,30 +77,19 @@ type PersistSchemasTask struct {
 	fetcher   registry.Fetcher
 }
 
-type EmbedSchemasTask_EmbedDestination struct {
-	Out    string
-	Module string
-}
-
 type EmbedSchemasTask struct {
 	internal.Task
 
-	dest EmbedSchemasTask_EmbedDestination
-
-	initialisms []string
-	// unionField is the envelope field holding the union of event records.
-	unionField string
-	// genTemplate is the code-generation template; empty means the built-in default.
-	genTemplate string
-
-	persister registry.Persister
+	cfg EmbedConfig
 
 	walker registry.Walker
 }
 
 // EmbedConfig configures the EmbedSchemas task.
 type EmbedConfig struct {
-	// Out is the destination directory for generated code.
+	// Out is the destination directory. Its base name is the package name of
+	// the generated embed.go, and each namespace gets a sub-package
+	// Out/<namespace> holding its schema versions and events.go.
 	Out string
 	// Module, if non-empty, is the Go module path to initialise at Out.
 	Module string
@@ -152,7 +145,7 @@ func (e *JobExecuter) CheckCompatibility(walker registry.Walker) *JobExecuter {
 	}
 
 	tt := &CheckCompatibilityTask{
-		Task:   internal.NewTask(CheckCompatibility),
+		Task:   internal.NewTask(CheckCompatibility, GenerateSchemas),
 		walker: walker,
 	}
 	e.tasks = append(e.tasks, tt)
@@ -167,7 +160,7 @@ func (e *JobExecuter) PersistSchemas(fetcher registry.Fetcher, persister registr
 	}
 
 	tt := &PersistSchemasTask{
-		Task:      internal.NewTask(PersistSchemas),
+		Task:      internal.NewTask(PersistSchemas, GenerateSchemas),
 		persister: persister,
 		fetcher:   fetcher,
 	}
@@ -175,30 +168,27 @@ func (e *JobExecuter) PersistSchemas(fetcher registry.Fetcher, persister registr
 	return e
 }
 
-// EmbedSchemas walks through the existing schemas in the registry, fetches each
-// version, persists it via the given persister, and generates Go types + an embed.FS
-// accessor at cfg.Out.
-func (e *JobExecuter) EmbedSchemas(walker registry.Walker, persister registry.Persister, cfg EmbedConfig) *JobExecuter {
+// EmbedSchemas walks every persisted schema version and writes, under cfg.Out:
+//
+//   - <namespace>/<version>@<id>.json: a copy of each version;
+//   - <namespace>/events.go: Go types generated from the latest version;
+//   - embed.go: an EmbedFS function exposing the copies as an embed.FS.
+//
+// The walker is usually the schema store PersistSchemas writes to. Out may be
+// that same directory.
+func (e *JobExecuter) EmbedSchemas(walker registry.Walker, cfg EmbedConfig) *JobExecuter {
 	if t := internal.TaskFrom[*EmbedSchemasTask](e.tasks); t != nil {
 		return e
 	}
 
-	unionField := cfg.UnionField
-	if unionField == "" {
-		unionField = "Data"
+	if cfg.UnionField == "" {
+		cfg.UnionField = "Data"
 	}
 
 	tt := &EmbedSchemasTask{
-		Task:      internal.NewTask(EmbedSchemas),
-		walker:    walker,
-		persister: persister,
-		dest: EmbedSchemasTask_EmbedDestination{
-			Out:    cfg.Out,
-			Module: cfg.Module,
-		},
-		initialisms: cfg.Initialisms,
-		unionField:  unionField,
-		genTemplate: cfg.Template,
+		Task:   internal.NewTask(EmbedSchemas),
+		walker: walker,
+		cfg:    cfg,
 	}
 	e.tasks = append(e.tasks, tt)
 	return e
@@ -206,8 +196,8 @@ func (e *JobExecuter) EmbedSchemas(walker registry.Walker, persister registry.Pe
 
 // Execute the job registered tasks in a logical order.
 func (e *JobExecuter) Execute(ctx context.Context) error {
-	sort.Slice(e.tasks, func(i, j int) bool {
-		return score[e.tasks[i].Name()] <= score[e.tasks[j].Name()]
+	sort.SliceStable(e.tasks, func(i, j int) bool {
+		return score[e.tasks[i].Name()] < score[e.tasks[j].Name()]
 	})
 
 	e.printer.Message("\nAbout to run:\n", nil)
@@ -239,14 +229,14 @@ func (e *JobExecuter) Execute(ctx context.Context) error {
 func (e *JobExecuter) executeTask(ctx context.Context, t internal.Task) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
-			err = fmt.Errorf("run task panicked: %s \nstack: %v", r, string(debug.Stack()))
+			err = fmt.Errorf("task %s panicked: %v\nstack: %s", t.Name(), r, debug.Stack())
 			return
 		}
 	}()
 
 	for _, d := range t.DependsOn() {
 		if _, ok := e.done[d]; !ok {
-			err = fmt.Errorf("task %s depends on %s", t, d)
+			err = fmt.Errorf("task %s requires task %s", t.Name(), d)
 			return
 		}
 	}
@@ -288,6 +278,14 @@ func (tt *GenerateSchemasTask) Run(ctx context.Context, deps ...any) error {
 	if err != nil {
 		return err
 	}
+	for ns, sch := range curs {
+		if sch == nil {
+			return fmt.Errorf("failed to run '%s': namespace %s has no schema", tt.Name(), ns)
+		}
+		if sch.Namespace() != ns {
+			return fmt.Errorf("failed to run '%s': schema %s is registered under namespace %s", tt.Name(), sch.FullName(), ns)
+		}
+	}
 	if len(curs) > 0 {
 		tt.schemas = curs
 	}
@@ -318,7 +316,7 @@ func (tt *CheckCompatibilityTask) Run(ctx context.Context, deps ...any) error {
 		}
 
 		if err := compat.Compatible(cur, schema); err != nil {
-			return fmt.Errorf("namespace: %s, incompatible with version: %d, err: %v", n, version, err)
+			return fmt.Errorf("namespace %s: current schema cannot read version %d (%s): %w", n, version, id, err)
 		}
 
 		return nil
@@ -364,39 +362,46 @@ func (tt *PersistSchemasTask) Run(ctx context.Context, deps ...any) error {
 }
 
 func (tt *EmbedSchemasTask) Run(ctx context.Context, _ ...any) error {
-	if tt.persister == nil {
-		return fmt.Errorf("failed to run '%s' persister not found", tt.Name())
-	}
 	if tt.walker == nil {
 		return fmt.Errorf("failed to run '%s' walker not found", tt.Name())
 	}
-	if tt.dest.Out == "" {
+	if tt.cfg.Out == "" {
 		return fmt.Errorf("failed to run '%s' destination output not found", tt.Name())
 	}
 
-	if err := internal.CheckDir(tt.dest.Out); err != nil {
-		return err
+	out := filepath.Clean(tt.cfg.Out)
+	packageName := filepath.Base(out)
+	if err := internal.PackageName(packageName); err != nil {
+		return fmt.Errorf("output directory %s: %w", out, err)
+	}
+	if m := tt.cfg.Module; m != "" && path.Base(m) != packageName {
+		return fmt.Errorf("%w: module %s must end with the package name %s", internal.ErrInvalidOutput, m, packageName)
 	}
 
-	splits := strings.Split(tt.dest.Out, "/")
-	packageName := splits[len(splits)-1]
-
-	if m := tt.dest.Module; m != "" && !strings.HasSuffix(m, packageName) {
-		return fmt.Errorf("packageName '%s' must be the same as module suffix '%s'", packageName, m)
-	}
-
-	outTemplate := tt.genTemplate
+	outTemplate := tt.cfg.Template
 	if outTemplate == "" {
 		outTemplate = defaultOutputTemplate
 	}
 
+	if err := internal.CheckDir(out); err != nil {
+		return err
+	}
+	dest := fs.NewDirAdapter(out)
+
 	n, err := tt.walker.Walk(ctx, func(id string, version int64, latest bool, schema *_avro.RecordSchema) error {
+		namespace := schema.Namespace()
+		if err := internal.PackageName(namespace); err != nil {
+			return fmt.Errorf("namespace of schema %s: %w", id, err)
+		}
+
+		// Copy the version. Persisting the same version and ID again is a
+		// no-op, so Out may be the store itself.
 		opt := func(pc *registry.PersistConfig) {
 			pc.Resolver = func(_ *_avro.RecordSchema) (string, int, error) {
 				return id, int(version), nil
 			}
 		}
-		if _, err := tt.persister.Persist(ctx, schema, opt); err != nil {
+		if _, err := dest.Persist(ctx, schema, opt); err != nil {
 			return err
 		}
 
@@ -404,42 +409,40 @@ func (tt *EmbedSchemasTask) Run(ctx context.Context, _ ...any) error {
 			return nil
 		}
 
-		namespace := schema.Namespace()
-		dir := tt.dest.Out + "/" + namespace
-
-		// generate event types from the latest
-		g := gen.NewGenerator(
-			schema.Namespace(), nil,
-			gen.WithFullName(false),
-			gen.WithEncoders(false),
-			gen.WithTemplate(outTemplate),
-			gen.WithInitialisms(tt.initialisms),
-		)
-
-		schemas, err := stravro.UnpackUnionRecords(schema, tt.unionField)
+		records, err := stravro.UnpackUnionRecords(schema, tt.cfg.UnionField)
 		if err != nil {
 			return err
 		}
-		for _, sc := range schemas {
-			g.Parse(sc)
+		if len(records) == 0 {
+			return fmt.Errorf("schema %s: no records in union field %s", id, tt.cfg.UnionField)
+		}
+		for _, rec := range records {
+			if err := checkCodegenSafe(rec, make(map[string]bool)); err != nil {
+				return fmt.Errorf("schema %s: %w", id, err)
+			}
+		}
+
+		// Generate Go types from the latest version.
+		g := gen.NewGenerator(
+			namespace, nil,
+			gen.WithFullName(false),
+			gen.WithEncoders(false),
+			gen.WithTemplate(outTemplate),
+			gen.WithInitialisms(tt.cfg.Initialisms),
+		)
+		for _, rec := range records {
+			g.Parse(rec)
 		}
 
 		var buf bytes.Buffer
 		if err = g.Write(&buf); err != nil {
 			return err
 		}
-		pretty, err := format.Source(buf.Bytes())
+		src, err := internal.FormatSource(buf.Bytes())
 		if err != nil {
-			return err
+			return fmt.Errorf("format generated code for namespace %s: %w", namespace, err)
 		}
-		if err := internal.CheckDir(dir); err != nil {
-			return err
-		}
-		if err := internal.WriteToFile(dir+"/"+"events.go", pretty); err != nil {
-			return err
-		}
-
-		return nil
+		return internal.WriteToFile(filepath.Join(out, namespace, "events.go"), src)
 	})
 	if err != nil {
 		return err
@@ -449,23 +452,21 @@ func (tt *EmbedSchemasTask) Run(ctx context.Context, _ ...any) error {
 		return nil
 	}
 
-	// generate code that exposes the embedded file system
-	data := struct {
-		PackageName string
-	}{
-		PackageName: packageName,
-	}
-	b, err := internal.RenderCode(embedSchemaTmpl, data)
+	// Generate the file that exposes the embedded schemas. It replaces the
+	// init.go that older versions generated.
+	b, err := internal.RenderCode(embedSchemaTmpl, struct{ PackageName string }{packageName})
 	if err != nil {
 		return err
 	}
-	if err := internal.WriteToFile(tt.dest.Out+"/"+"init.go", b); err != nil {
+	if err := internal.RemoveGenerated(filepath.Join(out, "init.go")); err != nil {
+		return err
+	}
+	if err := internal.WriteToFile(filepath.Join(out, "embed.go"), b); err != nil {
 		return err
 	}
 
-	// setup go module
-	if tt.dest.Module != "" {
-		if err := internal.SetupModule(tt.dest.Module, tt.dest.Out); err != nil {
+	if tt.cfg.Module != "" {
+		if err := internal.SetupModule(ctx, tt.cfg.Module, out); err != nil {
 			return err
 		}
 	}
@@ -473,19 +474,115 @@ func (tt *EmbedSchemasTask) Run(ctx context.Context, _ ...any) error {
 	return nil
 }
 
-var embedSchemaTmpl = template.Must(template.New("embed-schema-tmpl").Parse(`
-/*
- * Code Generated by ln80/struct-avro. DO NOT EDIT.
- */
+// checkCodegenSafe rejects schema text that would change the meaning of the
+// generated code: a doc with a line break ends the Go comment it is written in,
+// and a sensitive property value with a quote, backquote, comma or space breaks
+// out of the struct tag. Schemas this module generates never contain them; a
+// schema read from a shared registry might.
+func checkCodegenSafe(sch _avro.Schema, seen map[string]bool) error {
+	switch s := sch.(type) {
+	case *_avro.RecordSchema:
+		if seen[s.FullName()] {
+			return nil
+		}
+		seen[s.FullName()] = true
+		if err := checkDoc(s.FullName(), s.Doc()); err != nil {
+			return err
+		}
+		for _, f := range s.Fields() {
+			where := s.FullName() + "." + f.Name()
+			if err := checkDoc(where, f.Doc()); err != nil {
+				return err
+			}
+			if err := checkTagProp(where, f.Prop("sensitive")); err != nil {
+				return err
+			}
+			if err := checkCodegenSafe(f.Type(), seen); err != nil {
+				return err
+			}
+		}
+	case *_avro.RefSchema:
+		return checkCodegenSafe(s.Schema(), seen)
+	case *_avro.ArraySchema:
+		return checkCodegenSafe(s.Items(), seen)
+	case *_avro.MapSchema:
+		return checkCodegenSafe(s.Values(), seen)
+	case *_avro.UnionSchema:
+		for _, t := range s.Types() {
+			if err := checkCodegenSafe(t, seen); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func checkDoc(where, doc string) error {
+	if strings.ContainsAny(doc, "\r\n") {
+		return fmt.Errorf("%w: doc of %s has a line break", internal.ErrInvalidOutput, where)
+	}
+	return nil
+}
+
+func checkTagProp(where string, prop any) error {
+	if prop == nil {
+		return nil
+	}
+	// A parsed schema holds the property as a JSON object; a schema built in
+	// memory holds the value it was given. Compare both as JSON.
+	m, ok := prop.(map[string]any)
+	if !ok {
+		b, err := json.Marshal(prop)
+		if err == nil {
+			err = json.Unmarshal(b, &m)
+		}
+		if err != nil {
+			return fmt.Errorf("%w: sensitive property of %s is not an object", internal.ErrInvalidOutput, where)
+		}
+	}
+	parts := []any{m["ID"], m["Name"]}
+	if opts, ok := m["Options"].(map[string]any); ok {
+		for k, v := range opts {
+			parts = append(parts, k, v)
+		}
+	} else if m["Options"] != nil {
+		return fmt.Errorf("%w: sensitive options of %s are not an object", internal.ErrInvalidOutput, where)
+	}
+	for _, p := range parts {
+		str, ok := p.(string)
+		if !ok || !tagTextRe(str) {
+			return fmt.Errorf("%w: sensitive property of %s cannot be written as a struct tag", internal.ErrInvalidOutput, where)
+		}
+	}
+	if id := m["ID"].(string); !token.IsIdentifier(id) {
+		return fmt.Errorf("%w: sensitive property of %s cannot be written as a struct tag", internal.ErrInvalidOutput, where)
+	}
+	return nil
+}
+
+// tagTextRe reports whether s can sit in a struct tag value as written by the
+// template: printable ASCII without quote, backquote, backslash, comma or space.
+func tagTextRe(s string) bool {
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c <= ' ' || c > '~' || c == '"' || c == '`' || c == '\\' || c == ',' {
+			return false
+		}
+	}
+	return true
+}
+
+var embedSchemaTmpl = template.Must(template.New("embed-schema-tmpl").Parse(internal.GeneratedHeader + `
+
 package {{.PackageName}}
 
 import "embed"
 
-var (
-	//go:embed */*.json
-	schemas embed.FS
-)
+//go:embed */*.json
+var schemas embed.FS
 
+// EmbedFS returns every persisted schema version, stored as
+// <namespace>/<version>@<id>.json.
 func EmbedFS() embed.FS {
 	return schemas
 }
