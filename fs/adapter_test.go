@@ -10,6 +10,7 @@ import (
 
 	avro "github.com/ln80/avro/v2"
 	"github.com/ln80/struct-avro/registry"
+	"github.com/ln80/struct-avro/registrytest"
 )
 
 func TestWireFormatterRoundTrip(t *testing.T) {
@@ -333,4 +334,10 @@ func TestPersist_SameVersionTwiceIsIdempotent(t *testing.T) {
 	if !strings.Contains(got, `"ID"`) || strings.Contains(got, `"At"`) {
 		t.Fatalf("stored schema was overwritten: %s", got)
 	}
+}
+
+func TestAdapterConformance(t *testing.T) {
+	registrytest.Run(t, func(t *testing.T) registrytest.Store {
+		return NewDirAdapter(t.TempDir())
+	})
 }

@@ -130,8 +130,26 @@ func (p *Adapter) Persist(ctx context.Context, schema *avro.RecordSchema, opts .
 			id = hex.EncodeToString(fingerprint)
 			version = 1
 
+			// Writes go to dir, so versions are read from dir too, not from
+			// p.fs (which may be an embedded copy).
+			stored := os.DirFS(p.dir)
+
+			// The ID is the canonical fingerprint: a schema already stored
+			// keeps its version instead of being stored again.
+			var same []string
+			same, err = fs.Glob(stored, schema.Namespace()+"/*@"+id+".json")
+			if err != nil {
+				return
+			}
+			if len(same) > 0 {
+				var v int64
+				v, _, _, err = parseSchemaPath(same[0])
+				version = int(v)
+				return
+			}
+
 			var matches []string
-			matches, err = fs.Glob(p.fs, schema.Namespace()+"/*@*.json")
+			matches, err = fs.Glob(stored, schema.Namespace()+"/*@*.json")
 			if err != nil {
 				return
 			}
