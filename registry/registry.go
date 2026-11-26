@@ -373,6 +373,15 @@ func (r *Registry) EncodeWithID(ctx context.Context, id string, v any) ([]byte, 
 	return r.encode(id, e.writer, v)
 }
 
+// EncodeBatchWithID encodes vs, a slice, as an array of the stored schema id.
+func (r *Registry) EncodeBatchWithID(ctx context.Context, id string, vs any) ([]byte, error) {
+	e, err := r.entry(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	return r.encode(id, e.writerBatch, vs)
+}
+
 func (r *Registry) encode(id string, schema avro.Schema, v any) ([]byte, error) {
 	b, err := r.api.Marshal(schema, v)
 	if err != nil {

@@ -95,6 +95,18 @@ func TestOpenAndResolveOldData(t *testing.T) {
 	if string(again) != string(b) {
 		t.Fatal("EncodeWithID must reproduce the original bytes")
 	}
+
+	oldBatch, err := old.EncodeBatch([]v1{{ID: "a"}, {ID: "b"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	againBatch, err := cur.EncodeBatchWithID(ctx, id1, []v1{{ID: "a"}, {ID: "b"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(againBatch) != string(oldBatch) {
+		t.Fatal("EncodeBatchWithID must reproduce the original bytes")
+	}
 }
 
 func TestOpenFailsClosed(t *testing.T) {

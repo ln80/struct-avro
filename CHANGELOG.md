@@ -45,7 +45,8 @@ same IDs. Stored file names change (see below).
 - `EnvelopeConfig.Fingerprint`: names of the fingerprint fields.
 - `registry.WithLatestReader`: without a current schema, decode data into the
   latest stored schema of its namespace.
-- `Registry.Encode`, `EncodeBatch`, `EncodeWithID`, `Decode`, `DecodeBatch`.
+- `Registry.Encode`, `EncodeBatch`, `EncodeWithID`, `EncodeBatchWithID`,
+  `Decode`, `DecodeBatch`.
 - `RegisterEntries`, `ErrInvalidTag`, `ErrInvalidConfig`,
   `registry.ErrInvalidSchema`, `registry.ErrNoCurrentSchema`.
 - `registrytest`: a conformance suite for schema stores.
