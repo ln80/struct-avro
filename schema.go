@@ -11,6 +11,9 @@ import (
 	sensitive "github.com/ln80/struct-sensitive"
 )
 
+// ErrInvalidTag is returned when a struct field carries a tag that cannot be parsed.
+var ErrInvalidTag = errors.New("invalid struct tag")
+
 // Cache deduplicates named (record) schemas while walking a struct tree, so that a
 // type referenced more than once is emitted once and referenced via a RefSchema.
 type Cache map[string]avro.NamedSchema
@@ -377,7 +380,10 @@ func schemaOfStruct(t reflect.Type, avroOpts []avro.SchemaOption, cfg *Config, c
 			avroFieldOpts = append(avroFieldOpts, avro.WithAliases(aliases))
 		}
 
-		tagPayload := sensitive.ParseTag(f.Tag)
+		tagPayload, err := sensitive.ParseTag(f.Tag)
+		if err != nil {
+			return nil, fmt.Errorf("%w: field %s.%s: %w", ErrInvalidTag, fullName, f.Name, err)
+		}
 		if tagPayload != nil {
 			avroFieldOpts = append(avroFieldOpts, avro.WithProps(map[string]any{
 				"sensitive": tagPayload,

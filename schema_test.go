@@ -1,6 +1,7 @@
 package avro
 
 import (
+	"errors"
 	"reflect"
 	"testing"
 
@@ -160,4 +161,38 @@ func assertFieldHasDefault(t *testing.T, rec *avro.RecordSchema, fieldName strin
 		}
 	}
 	t.Fatalf("field %s not found on %s", fieldName, rec.FullName())
+}
+
+func TestSchemaOfSensitiveTags(t *testing.T) {
+	t.Run("valid data tag with replace", func(t *testing.T) {
+		type Ev struct {
+			Email string `pii:"data,replace=redacted"`
+		}
+		if _, err := SchemaOf(reflect.TypeOf(Ev{}), WithNamespace("ns")); err != nil {
+			t.Fatalf("expect valid tag, got %v", err)
+		}
+	})
+
+	invalid := map[string]reflect.Type{
+		"unknown name": reflect.TypeOf(struct {
+			Email string `pii:"datum"`
+		}{}),
+		"unknown option": reflect.TypeOf(struct {
+			Email string `pii:"data,knd=email"`
+		}{}),
+		"repeated option": reflect.TypeOf(struct {
+			Email string `pii:"data,kind=a,kind=b"`
+		}{}),
+		"two tag ids": reflect.TypeOf(struct {
+			Email string `pii:"data" sensitive:"data"`
+		}{}),
+	}
+	for name, typ := range invalid {
+		t.Run(name, func(t *testing.T) {
+			_, err := SchemaOf(typ, WithName("Ev"), WithNamespace("ns"))
+			if !errors.Is(err, ErrInvalidTag) {
+				t.Fatalf("expect ErrInvalidTag, got %v", err)
+			}
+		})
+	}
 }
