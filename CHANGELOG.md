@@ -43,6 +43,8 @@ same IDs. Stored file names change (see below).
   `EnvelopeConfig.Annotator` and `WithFieldAnnotator`: annotate fields from
   any tag.
 - `EnvelopeConfig.Fingerprint`: names of the fingerprint fields.
+- `registry.WithLatestReader`: without a current schema, decode data into the
+  latest stored schema of its namespace.
 - `Registry.Encode`, `EncodeBatch`, `EncodeWithID`, `Decode`, `DecodeBatch`.
 - `RegisterEntries`, `ErrInvalidTag`, `ErrInvalidConfig`,
   `registry.ErrInvalidSchema`, `registry.ErrNoCurrentSchema`.

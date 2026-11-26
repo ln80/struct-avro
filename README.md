@@ -61,6 +61,9 @@ _, err = reg.Decode(ctx, b, &out) // out.Data is *AccountOpened
 
 `registry.Open` fails if the store does not hold the current schema. Data
 written with an older version is resolved against the current one when decoded.
+A reader that handles every namespace and has no current schema uses
+`registry.WithLatestReader()` to decode into the latest stored schema of each
+namespace.
 
 ## Tags
 

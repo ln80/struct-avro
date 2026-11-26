@@ -246,3 +246,76 @@ func TestGetSchema_InvalidFetchedSchemaFailsWithoutPanic(t *testing.T) {
 		})
 	}
 }
+
+func TestLatestReader(t *testing.T) {
+	ctx := context.Background()
+	a := fs.NewDirAdapter(t.TempDir())
+	// v2 renames Owner to Client (alias) and adds At with a default.
+	v1 := parse(t, `{"type":"record","name":"events","namespace":"bank","fields":[{"name":"ID","type":"string"},{"name":"Owner","type":"string"}]}`)
+	v2 := parse(t, `{"type":"record","name":"events","namespace":"bank","fields":[{"name":"ID","type":"string"},{"name":"Client","type":"string","aliases":["Owner"]},{"name":"At","type":"long","default":7}]}`)
+	other := parse(t, `{"type":"record","name":"events","namespace":"shop","fields":[{"name":"ID","type":"string"}]}`)
+	for _, s := range []*avro.RecordSchema{v1, v2, other} {
+		if _, err := a.Persist(ctx, s); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	type old struct {
+		ID    string `avro:"ID"`
+		Owner string `avro:"Owner"`
+	}
+	type latest struct {
+		ID     string `avro:"ID"`
+		Client string `avro:"Client"`
+		At     int64  `avro:"At"`
+	}
+	w, err := registry.Open(ctx, a, registry.WithCurrent(v1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := w.Encode(old{ID: "1", Owner: "ada"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	r, err := registry.Open(ctx, a, registry.WithLatestReader())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got latest
+	if _, err := r.Decode(ctx, b, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got != (latest{ID: "1", Client: "ada", At: 7}) {
+		t.Fatalf("decode into the latest schema: %+v", got)
+	}
+
+	// Data of another namespace decodes into that namespace's latest schema.
+	ws, err := registry.Open(ctx, a, registry.WithCurrent(other))
+	if err != nil {
+		t.Fatal(err)
+	}
+	bs, err := ws.Encode(v1Record{ID: "s"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var gotShop v1Record
+	if _, err := r.Decode(ctx, bs, &gotShop); err != nil || gotShop.ID != "s" {
+		t.Fatalf("other namespace: %+v %v", gotShop, err)
+	}
+}
+
+type v1Record struct {
+	ID string `avro:"ID"`
+}
+
+func TestLatestReaderNeedsWalkerAndNoCurrent(t *testing.T) {
+	ctx := context.Background()
+	if _, err := registry.Open(ctx, stubFetcher{}, registry.WithWireFormatter(fs.NewWireFormatter()), registry.WithLatestReader()); !errors.Is(err, registry.ErrUnableToSetupRegistry) {
+		t.Fatalf("store without Walker: %v", err)
+	}
+	a, _, _ := store(t)
+	if _, err := registry.Open(ctx, a, registry.WithCurrent(parse(t, recV1)), registry.WithLatestReader()); !errors.Is(err, registry.ErrUnableToSetupRegistry) {
+		t.Fatalf("with a current schema: %v", err)
+	}
+}

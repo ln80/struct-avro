@@ -76,6 +76,7 @@ type options struct {
 	current        *avro.RecordSchema
 	readerOnly     bool
 	persistCurrent bool
+	latestReader   bool
 }
 
 // WithAPI sets the Avro API used to encode and decode. The default is
@@ -101,6 +102,13 @@ func WithCurrent(schema *avro.RecordSchema) Option {
 func WithReaderSchema(schema *avro.RecordSchema) Option {
 	return func(o *options) { o.current, o.readerOnly = schema, true }
 }
+
+// WithLatestReader decodes data written with any schema into the latest stored
+// schema of the same namespace, when the registry has no current schema. Fields
+// added later get their defaults and renamed fields are matched by alias. The
+// store must implement Walker. Use it in readers that handle every namespace,
+// such as a forwarder, without a current schema of their own.
+func WithLatestReader() Option { return func(o *options) { o.latestReader = true } }
 
 // WithPersistCurrent persists the current schema when the store does not have
 // it. The store must implement Persister. Use it in development only: in
@@ -130,6 +138,11 @@ type Registry struct {
 	// current is nil when the registry has no current schema. Its id is empty
 	// when it was set with WithReaderSchema.
 	current *schemaEntry
+
+	// walker is set by WithLatestReader when there is no current schema.
+	walker   Walker
+	latestMu sync.Mutex
+	latest   map[string]*avro.RecordSchema
 
 	mu    sync.RWMutex
 	cache map[string]*schemaEntry
@@ -169,7 +182,18 @@ func Open(ctx context.Context, store Fetcher, opts ...Option) (*Registry, error)
 		if o.persistCurrent {
 			return nil, fmt.Errorf("%w: WithPersistCurrent needs WithCurrent", ErrUnableToSetupRegistry)
 		}
+		if o.latestReader {
+			w, ok := store.(Walker)
+			if !ok {
+				return nil, fmt.Errorf("%w: WithLatestReader needs a store that implements Walker", ErrUnableToSetupRegistry)
+			}
+			r.walker = w
+			r.latest = make(map[string]*avro.RecordSchema)
+		}
 		return r, nil
+	}
+	if o.latestReader {
+		return nil, fmt.Errorf("%w: WithLatestReader cannot be used with a current or reader schema", ErrUnableToSetupRegistry)
 	}
 
 	if o.readerOnly {
@@ -255,6 +279,21 @@ func (r *Registry) entry(ctx context.Context, id string) (*schemaEntry, error) {
 	}
 
 	reader := writer
+	if r.walker != nil {
+		latest, err := r.latestOf(ctx, writer.Namespace())
+		if err != nil {
+			return nil, err
+		}
+		if latest != nil && latest.Fingerprint() != writer.Fingerprint() {
+			resolved, err := r.compatibility.Resolve(latest, writer)
+			if err != nil {
+				return nil, fmt.Errorf("%w: schema %s: %w", ErrUnableToResolveSchema, id, err)
+			}
+			if reader, ok = resolved.(*avro.RecordSchema); !ok {
+				return nil, fmt.Errorf("%w: schema %s did not resolve to a record", ErrUnableToResolveSchema, id)
+			}
+		}
+	}
 	if r.current != nil {
 		resolved, err := r.compatibility.Resolve(r.current.reader, writer)
 		if err != nil {
@@ -273,6 +312,27 @@ func (r *Registry) entry(ctx context.Context, id string) (*schemaEntry, error) {
 	}
 	r.cache[id] = e
 	return e, nil
+}
+
+// latestOf returns the latest stored schema of namespace, or nil if it has none.
+// It walks the store once per namespace.
+func (r *Registry) latestOf(ctx context.Context, namespace string) (*avro.RecordSchema, error) {
+	r.latestMu.Lock()
+	defer r.latestMu.Unlock()
+	if s, ok := r.latest[namespace]; ok {
+		return s, nil
+	}
+	var latest *avro.RecordSchema
+	if _, err := r.walker.Walk(ctx, func(_ string, _ int64, isLatest bool, s *avro.RecordSchema) error {
+		if isLatest && s.Namespace() == namespace {
+			latest = s
+		}
+		return nil
+	}, func(c *WalkConfig) { c.Namespaces = []string{namespace} }); err != nil {
+		return nil, fmt.Errorf("%w: latest schema of %s: %w", ErrUnableToResolveSchema, namespace, err)
+	}
+	r.latest[namespace] = latest
+	return latest, nil
 }
 
 // GetSchema returns the schema to decode data written under id: the stored
