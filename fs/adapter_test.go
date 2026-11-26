@@ -301,3 +301,36 @@ func TestWalk_RejectsInvalidSchemaFiles(t *testing.T) {
 		})
 	}
 }
+
+func TestPersist_SameVersionTwiceIsIdempotent(t *testing.T) {
+	dir := t.TempDir()
+	a := NewDirAdapter(dir)
+	s := avro.MustParse(recV1).(*avro.RecordSchema)
+	fixed := func(pc *registry.PersistConfig) {
+		pc.Resolver = func(*avro.RecordSchema) (string, int, error) { return "aaaaaaaaaaaaaaaa", 3, nil }
+	}
+	for i := 0; i < 2; i++ {
+		if _, err := a.Persist(context.Background(), s, fixed); err != nil {
+			t.Fatalf("persist %d: %v", i, err)
+		}
+	}
+
+	// Same version and ID, different schema: refused, file kept.
+	if _, err := a.Persist(context.Background(), avro.MustParse(recV2).(*avro.RecordSchema), fixed); !errors.Is(err, registry.ErrCreateOrUpdateSchemaFailed) {
+		t.Fatalf("expect ErrCreateOrUpdateSchemaFailed, got %v", err)
+	}
+	// Same version, other ID: refused.
+	other := func(pc *registry.PersistConfig) {
+		pc.Resolver = func(*avro.RecordSchema) (string, int, error) { return "bbbbbbbbbbbbbbbb", 3, nil }
+	}
+	if _, err := a.Persist(context.Background(), s, other); !errors.Is(err, registry.ErrCreateOrUpdateSchemaFailed) {
+		t.Fatalf("expect ErrCreateOrUpdateSchemaFailed, got %v", err)
+	}
+	got, err := a.Get(context.Background(), "aaaaaaaaaaaaaaaa")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(got, `"ID"`) || strings.Contains(got, `"At"`) {
+		t.Fatalf("stored schema was overwritten: %s", got)
+	}
+}

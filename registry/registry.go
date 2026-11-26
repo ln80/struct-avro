@@ -7,6 +7,7 @@ import (
 	"sync"
 
 	"github.com/ln80/avro/v2"
+	stravro "github.com/ln80/struct-avro"
 )
 
 var (
@@ -96,7 +97,7 @@ func New(fetcher Fetcher, persister Persister, wf WireFormatter) *Registry {
 		fetcher:            fetcher,
 		persister:          persister,
 		compatibility:      avro.NewSchemaCompatibility(),
-		api:                avro.Config{PartialUnionTypeResolution: true, UnionResolutionError: false}.Freeze(),
+		api:                stravro.NewAPI(),
 		cache:              make(map[string]schemaEntry),
 		cacheByFingerprint: make(map[string]string),
 		current:            nil,
@@ -119,10 +120,8 @@ func (r *Registry) AppendSchemaID(data []byte, id string) ([]byte, error) {
 // caching the result. Caller must NOT hold r.mu.
 func (r *Registry) getSchemaByDefinition(ctx context.Context, schema avro.Schema) (string, error) {
 	fp := schema.Fingerprint()
-	fpKey := string(fp[:])
-
 	r.mu.RLock()
-	if id, ok := r.cacheByFingerprint[fpKey]; ok {
+	if id, ok := r.cacheByFingerprint[string(fp[:])]; ok {
 		r.mu.RUnlock()
 		return id, nil
 	}

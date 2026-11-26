@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -108,23 +109,25 @@ func maxVersionAmong(matches []string) (int64, error) {
 
 // Persist implements registry.Persister.
 func (p *Adapter) Persist(ctx context.Context, schema *avro.RecordSchema, opts ...func(*registry.PersistConfig)) (string, error) {
-	if _, err := os.Stat(p.dir); os.IsNotExist(err) {
-		return "", err
+	if _, err := os.Stat(p.dir); err != nil {
+		return "", fmt.Errorf("%w: %w", registry.ErrCreateOrUpdateSchemaFailed, err)
 	}
 
 	namespace := schema.Namespace()
 	dir := filepath.Join(p.dir, namespace)
 
-	if _, err := os.Stat(dir); os.IsNotExist(err) {
-		if err := os.MkdirAll(dir, 0o750); err != nil {
-			return "", err
-		}
+	if err := os.MkdirAll(dir, 0o750); err != nil {
+		return "", fmt.Errorf("%w: %w", registry.ErrCreateOrUpdateSchemaFailed, err)
 	}
 
 	cfg := &registry.PersistConfig{
 		Resolver: func(schema *avro.RecordSchema) (id string, version int, err error) {
-			fingerprint, _ := schema.FingerprintUsing(avro.CRC64Avro)
-			id = hex.EncodeToString(fingerprint[:])
+			var fingerprint []byte
+			fingerprint, err = schema.FingerprintUsing(avro.CRC64Avro)
+			if err != nil {
+				return
+			}
+			id = hex.EncodeToString(fingerprint)
 			version = 1
 
 			var matches []string
@@ -157,12 +160,12 @@ func (p *Adapter) Persist(ctx context.Context, schema *avro.RecordSchema, opts .
 		return "", err
 	}
 
-	path := filepath.Clean(filepath.Join(dir, strconv.Itoa(version)+"@"+id+".json"))
-	file, err := os.Create(path)
-	if err != nil {
-		return "", err
+	if !validID(id) {
+		return "", fmt.Errorf("%w: resolver returned an invalid ID", registry.ErrInvalidSchemaID)
 	}
-	defer file.Close()
+	if version < 1 {
+		return "", fmt.Errorf("%w: resolver returned version %d", registry.ErrCreateOrUpdateSchemaFailed, version)
+	}
 
 	b, err := schema.MarshalJSON()
 	if err != nil {
@@ -173,14 +176,76 @@ func (p *Adapter) Persist(ctx context.Context, schema *avro.RecordSchema, opts .
 		return "", err
 	}
 
-	if _, err := file.Write(pretty.Bytes()); err != nil {
+	name := strconv.Itoa(version) + "@" + id + ".json"
+	taken, err := fs.Glob(os.DirFS(dir), strconv.Itoa(version)+"@*.json")
+	if err != nil {
 		return "", err
+	}
+	for _, other := range taken {
+		if other != name {
+			return "", fmt.Errorf("%w: %s/%d is already stored as %s", registry.ErrCreateOrUpdateSchemaFailed, namespace, version, other)
+		}
+	}
+
+	path := filepath.Clean(filepath.Join(dir, name))
+	if err := writeNewFile(path, pretty.Bytes()); err != nil {
+		if !errors.Is(err, fs.ErrExist) {
+			return "", fmt.Errorf("%w: %w", registry.ErrCreateOrUpdateSchemaFailed, err)
+		}
+		// The same version and ID is stored already. Persisting it again is a
+		// no-op when the schema is the same, and an error otherwise.
+		same, err := sameSchemaFile(path, b)
+		if err != nil {
+			return "", fmt.Errorf("%w: %w", registry.ErrCreateOrUpdateSchemaFailed, err)
+		}
+		if !same {
+			return "", fmt.Errorf("%w: %s holds a different schema", registry.ErrCreateOrUpdateSchemaFailed, name)
+		}
 	}
 
 	return id, nil
 }
 
 var _ registry.Persister = &Adapter{}
+
+// sameSchemaFile reports whether the schema stored at path has the same
+// canonical form and properties as the JSON schema b.
+func sameSchemaFile(path string, b []byte) (bool, error) {
+	stored, err := os.ReadFile(path) // #nosec G304 -- path is built from a validated version and ID under the adapter dir
+	if err != nil {
+		return false, err
+	}
+	var x, y any
+	if err := json.Unmarshal(stored, &x); err != nil {
+		return false, fmt.Errorf("%w: %s: %w", registry.ErrInvalidSchema, filepath.Base(path), err)
+	}
+	if err := json.Unmarshal(b, &y); err != nil {
+		return false, err
+	}
+	xb, _ := json.Marshal(x)
+	yb, _ := json.Marshal(y)
+	return bytes.Equal(xb, yb), nil
+}
+
+// writeNewFile writes b to a file that must not exist yet. A version is written
+// once: an existing file means another writer took that version, and is never
+// overwritten. On a failed write the partial file is removed.
+func writeNewFile(path string, b []byte) (err error) {
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o640) // #nosec G304 -- path is built from a validated version and ID under the adapter dir
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if cerr := file.Close(); err == nil {
+			err = cerr
+		}
+		if err != nil {
+			_ = os.Remove(path)
+		}
+	}()
+	_, err = file.Write(b)
+	return err
+}
 
 // Get implements registry.Fetcher.
 func (f *Adapter) Get(ctx context.Context, id string) (string, error) {
@@ -203,7 +268,7 @@ func (f *Adapter) Get(ctx context.Context, id string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 
 	b, err := io.ReadAll(file)
 	if err != nil {
@@ -245,7 +310,7 @@ func (f *Adapter) readSchema(path string) (id string, schema avro.Schema, err er
 	if err != nil {
 		return "", nil, err
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 
 	b, err := io.ReadAll(file)
 	if err != nil {
