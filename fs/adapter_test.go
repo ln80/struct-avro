@@ -165,9 +165,9 @@ func writeSchema(t *testing.T, dir, namespace, filename, body string) {
 
 func TestWalk_LatestIsNumericMax_CrossingTen(t *testing.T) {
 	dir := t.TempDir()
-	writeSchema(t, dir, "ns", "9@a.json", minimalRecord)
-	writeSchema(t, dir, "ns", "10@b.json", minimalRecord)
-	writeSchema(t, dir, "ns", "12@c.json", minimalRecord)
+	writeSchema(t, dir, "ns", "9@aaaaaaaaaaaaaaaa.json", minimalRecord)
+	writeSchema(t, dir, "ns", "10@bbbbbbbbbbbbbbbb.json", minimalRecord)
+	writeSchema(t, dir, "ns", "12@cccccccccccccccc.json", minimalRecord)
 
 	adapter := NewDirAdapter(dir)
 	seen := map[int64]bool{}
@@ -199,7 +199,7 @@ func TestWalk_LatestIsNumericMax_CrossingTen(t *testing.T) {
 
 func TestWalk_LatestAmongSingleDigitVersions(t *testing.T) {
 	dir := t.TempDir()
-	for _, name := range []string{"1@a.json", "5@b.json", "9@c.json"} {
+	for _, name := range []string{"1@aaaaaaaaaaaaaaaa.json", "5@bbbbbbbbbbbbbbbb.json", "9@cccccccccccccccc.json"} {
 		writeSchema(t, dir, "ns", name, minimalRecord)
 	}
 
@@ -221,8 +221,8 @@ func TestWalk_LatestAmongSingleDigitVersions(t *testing.T) {
 
 func TestPersist_NextVersionIsNumericMaxPlusOne(t *testing.T) {
 	dir := t.TempDir()
-	writeSchema(t, dir, "bank", "9@a.json", recV1)
-	writeSchema(t, dir, "bank", "10@b.json", recV1)
+	writeSchema(t, dir, "bank", "9@aaaaaaaaaaaaaaaa.json", recV1)
+	writeSchema(t, dir, "bank", "10@bbbbbbbbbbbbbbbb.json", recV1)
 
 	a := NewDirAdapter(dir)
 	id, err := a.Persist(context.Background(), avro.MustParse(recV2).(*avro.RecordSchema))
@@ -236,9 +236,9 @@ func TestPersist_NextVersionIsNumericMaxPlusOne(t *testing.T) {
 
 func TestMaxVersionAmong(t *testing.T) {
 	max, err := maxVersionAmong([]string{
-		"ns/9@a.json",
-		"ns/10@b.json",
-		"ns/12@c.json",
+		"ns/9@aaaaaaaaaaaaaaaa.json",
+		"ns/10@bbbbbbbbbbbbbbbb.json",
+		"ns/12@cccccccccccccccc.json",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -258,4 +258,46 @@ func slicesEqual(a, b []int64) bool {
 		}
 	}
 	return true
+}
+
+func TestGet_RejectsInvalidID(t *testing.T) {
+	dir := t.TempDir()
+	writeSchema(t, dir, "ns", "1@aaaaaaaaaaaaaaaa.json", minimalRecord)
+	adapter := NewDirAdapter(dir)
+
+	// '*' and '?' would match another schema's file if used in the glob pattern.
+	for _, id := range []string{"****************", "????????????????", "[a]aaaaaaaaaaaaa", "AAAAAAAAAAAAAAAA", "short", ""} {
+		if _, err := adapter.Get(context.Background(), id); !errors.Is(err, registry.ErrInvalidSchemaID) {
+			t.Fatalf("id %q: expect ErrInvalidSchemaID, got %v", id, err)
+		}
+	}
+	if _, err := adapter.Get(context.Background(), "aaaaaaaaaaaaaaaa"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestExtractSchemaID_RejectsNonHexPrefix(t *testing.T) {
+	wf := NewWireFormatter()
+	if _, _, err := wf.ExtractSchemaID([]byte("****************payload")); !errors.Is(err, registry.ErrInvalidDataWireFormat) {
+		t.Fatalf("expect ErrInvalidDataWireFormat, got %v", err)
+	}
+}
+
+func TestWalk_RejectsInvalidSchemaFiles(t *testing.T) {
+	cases := map[string]struct{ name, body string }{
+		"not a record": {"1@aaaaaaaaaaaaaaaa.json", `"string"`},
+		"not json":     {"1@aaaaaaaaaaaaaaaa.json", `{`},
+		"bad id":       {"1@zzzzzzzzzzzzzzzz.json", minimalRecord},
+		"zero version": {"0@aaaaaaaaaaaaaaaa.json", minimalRecord},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			writeSchema(t, dir, "ns", tc.name, tc.body)
+			_, err := NewDirAdapter(dir).Walk(context.Background(), func(string, int64, bool, *avro.RecordSchema) error { return nil })
+			if err == nil {
+				t.Fatal("expect error")
+			}
+		})
+	}
 }

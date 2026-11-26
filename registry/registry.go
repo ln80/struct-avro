@@ -17,6 +17,7 @@ var (
 	ErrUnableToSetupRegistry       = errors.New("unable to setup registry")
 	ErrCreateOrUpdateSchemaFailed  = errors.New("failed to create or update schema")
 	ErrSchemaNotFound              = errors.New("schema not found")
+	ErrInvalidSchema               = errors.New("invalid schema")
 )
 
 // WireFormatter frames/unframes the schema ID into/out of an encoded payload.
@@ -138,17 +139,22 @@ func (r *Registry) getSchemaByDefinition(ctx context.Context, schema avro.Schema
 	if r.current != nil && r.current.schemaID != id {
 		schema, err = r.compatibility.Resolve(r.current.schema, schema)
 		if err != nil {
-			return "", err
+			return "", fmt.Errorf("%w: schema %s: %w", ErrUnableToResolveSchema, id, err)
 		}
 	}
-	r.storeLocked(id, schema)
+	if err := r.storeLocked(id, schema); err != nil {
+		return "", err
+	}
 
 	return id, nil
 }
 
 // storeLocked records a resolved schema in the cache. Caller must hold r.mu.
-func (r *Registry) storeLocked(id string, schema avro.Schema) {
-	rec := schema.(*avro.RecordSchema)
+func (r *Registry) storeLocked(id string, schema avro.Schema) error {
+	rec, ok := schema.(*avro.RecordSchema)
+	if !ok {
+		return fmt.Errorf("%w: schema %s is not a record", ErrInvalidSchema, id)
+	}
 	r.cache[id] = schemaEntry{
 		schema:      rec,
 		batchSchema: avro.NewArraySchema(schema),
@@ -156,6 +162,7 @@ func (r *Registry) storeLocked(id string, schema avro.Schema) {
 	}
 	fp := rec.Fingerprint()
 	r.cacheByFingerprint[string(fp[:])] = id
+	return nil
 }
 
 // API returns the underlying AVRO API.
@@ -183,10 +190,15 @@ func (r *Registry) Setup(ctx context.Context, schema avro.Schema, opts ...func(*
 		return nil
 	}
 
+	rec, ok := schema.(*avro.RecordSchema)
+	if !ok {
+		return fmt.Errorf("%w: %w: current schema is not a record", ErrUnableToSetupRegistry, ErrInvalidSchema)
+	}
+
 	if r.cfg.ReadOnly {
 		r.current = &schemaEntry{
-			schema:      schema.(*avro.RecordSchema),
-			batchSchema: avro.NewArraySchema(schema),
+			schema:      rec,
+			batchSchema: avro.NewArraySchema(rec),
 		}
 		return nil
 	}
@@ -194,12 +206,15 @@ func (r *Registry) Setup(ctx context.Context, schema avro.Schema, opts ...func(*
 	id, err := r.getSchemaByDefinition(ctx, schema)
 	if err != nil {
 		if errors.Is(err, ErrSchemaNotFound) && r.cfg.PersistCurrent {
-			id, err = r.persister.Persist(ctx, schema.(*avro.RecordSchema))
+			if r.persister == nil {
+				return fmt.Errorf("%w: no persister", ErrCreateOrUpdateSchemaFailed)
+			}
+			id, err = r.persister.Persist(ctx, rec)
 			if err != nil {
-				return fmt.Errorf("%w: %v", ErrCreateOrUpdateSchemaFailed, err)
+				return fmt.Errorf("%w: %w", ErrCreateOrUpdateSchemaFailed, err)
 			}
 		} else {
-			return fmt.Errorf("%w: %v", ErrUnableToSetupRegistry, err)
+			return fmt.Errorf("%w: %w", ErrUnableToSetupRegistry, err)
 		}
 	}
 
@@ -207,8 +222,8 @@ func (r *Registry) Setup(ctx context.Context, schema avro.Schema, opts ...func(*
 	defer r.mu.Unlock()
 	r.current = &schemaEntry{
 		schemaID:    id,
-		schema:      schema.(*avro.RecordSchema),
-		batchSchema: avro.NewArraySchema(schema),
+		schema:      rec,
+		batchSchema: avro.NewArraySchema(rec),
 	}
 
 	return nil
@@ -255,16 +270,25 @@ func (r *Registry) GetSchema(ctx context.Context, id string) (string, *avro.Reco
 		return "", nil, nil, err
 	}
 
-	schema := avro.MustParse(out)
+	schema, err := avro.Parse(out)
+	if err != nil {
+		return "", nil, nil, fmt.Errorf("%w: schema %s: %w", ErrInvalidSchema, id, err)
+	}
+	if _, ok := schema.(*avro.RecordSchema); !ok {
+		return "", nil, nil, fmt.Errorf("%w: schema %s is not a record", ErrInvalidSchema, id)
+	}
 	if r.current != nil {
 		schema, err = r.compatibility.Resolve(r.current.schema, schema)
 		if err != nil {
-			return "", nil, nil, err
+			return "", nil, nil, fmt.Errorf("%w: schema %s: %w", ErrUnableToResolveSchema, id, err)
 		}
 	}
 
 	r.mu.Lock()
-	r.storeLocked(id, schema)
+	if err := r.storeLocked(id, schema); err != nil {
+		r.mu.Unlock()
+		return "", nil, nil, err
+	}
 	res := r.cache[id]
 	r.mu.Unlock()
 

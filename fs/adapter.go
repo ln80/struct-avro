@@ -40,6 +40,22 @@ func NewDirAdapter(dir string) *Adapter {
 	return NewAdapter(os.DirFS(dir), dir)
 }
 
+// validID reports whether id is a schema ID this adapter writes: the lowercase
+// hex encoding of an 8-byte fingerprint. It is checked before an ID is used in a
+// glob pattern, because an ID read from stored bytes may hold '*', '?' or '['.
+func validID(id string) bool {
+	if len(id) != schemaIDLen {
+		return false
+	}
+	for i := 0; i < len(id); i++ {
+		c := id[i]
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
 // parseSchemaPath extracts (version, namespace, id) from a "<ns>/<version>@<id>.json" path.
 func parseSchemaPath(path string) (version int64, namespace, id string, err error) {
 	splits := strings.Split(path, "/")
@@ -60,7 +76,15 @@ func parseSchemaPath(path string) (version int64, namespace, id string, err erro
 		err = fmt.Errorf("invalid schema path: '%s' bad version: %w", path, err)
 		return
 	}
-	id = strings.TrimSpace(strings.TrimSuffix(at[1], ".json"))
+	if version < 1 {
+		err = fmt.Errorf("invalid schema path: '%s' version must be positive", path)
+		return
+	}
+	id = strings.TrimSuffix(at[1], ".json")
+	if !validID(id) {
+		err = fmt.Errorf("%w: invalid schema path: '%s'", registry.ErrInvalidSchemaID, path)
+		return
+	}
 	return
 }
 
@@ -160,6 +184,9 @@ var _ registry.Persister = &Adapter{}
 
 // Get implements registry.Fetcher.
 func (f *Adapter) Get(ctx context.Context, id string) (string, error) {
+	if !validID(id) {
+		return "", registry.ErrInvalidSchemaID
+	}
 	matches, err := fs.Glob(f.fs, "*/*@"+id+".json")
 	if err != nil {
 		return "", err
@@ -167,6 +194,9 @@ func (f *Adapter) Get(ctx context.Context, id string) (string, error) {
 
 	if len(matches) == 0 {
 		return "", fmt.Errorf("%w: %s", registry.ErrSchemaNotFound, id)
+	}
+	if len(matches) > 1 {
+		return "", fmt.Errorf("%w: schema %s is stored more than once", registry.ErrInvalidSchema, id)
 	}
 
 	file, err := f.fs.Open(matches[0])
@@ -223,7 +253,7 @@ func (f *Adapter) readSchema(path string) (id string, schema avro.Schema, err er
 	}
 	schema, err = avro.ParseBytes(b)
 	if err != nil {
-		return "", nil, err
+		return "", nil, fmt.Errorf("%w: %s: %w", registry.ErrInvalidSchema, path, err)
 	}
 	_, _, id, err = parseSchemaPath(path)
 	return id, schema, err
@@ -296,8 +326,12 @@ func (f *Adapter) Walk(ctx context.Context, fn func(id string, version int64, la
 			return 0, err
 		}
 
+		rec, ok := sch.(*avro.RecordSchema)
+		if !ok {
+			return 0, fmt.Errorf("%w: %s is not a record", registry.ErrInvalidSchema, e.path)
+		}
 		latest := e.version == maxByNS[e.namespace]
-		if err := fn(e.id, e.version, latest, sch.(*avro.RecordSchema)); err != nil {
+		if err := fn(e.id, e.version, latest, rec); err != nil {
 			return 0, err
 		}
 
@@ -314,10 +348,10 @@ type WireFormatter struct{}
 
 // AppendSchemaID implements registry.WireFormatter.
 func (*WireFormatter) AppendSchemaID(data []byte, id string) ([]byte, error) {
-	bid := []byte(id)
-	if len(bid) != schemaIDLen {
-		return nil, fmt.Errorf("%w: expected length %d, got %d", registry.ErrInvalidSchemaID, schemaIDLen, len(bid))
+	if !validID(id) {
+		return nil, fmt.Errorf("%w: expected %d lowercase hex characters", registry.ErrInvalidSchemaID, schemaIDLen)
 	}
+	bid := []byte(id)
 
 	out := make([]byte, 0, schemaIDLen+len(data))
 	out = append(out, bid...)
@@ -331,7 +365,11 @@ func (*WireFormatter) ExtractSchemaID(data []byte) (string, []byte, error) {
 		return "", nil, fmt.Errorf("%w: data too short", registry.ErrInvalidDataWireFormat)
 	}
 
-	return string(data[0:schemaIDLen]), data[schemaIDLen:], nil
+	id := string(data[0:schemaIDLen])
+	if !validID(id) {
+		return "", nil, fmt.Errorf("%w: invalid schema ID prefix", registry.ErrInvalidDataWireFormat)
+	}
+	return id, data[schemaIDLen:], nil
 }
 
 func NewWireFormatter() *WireFormatter {

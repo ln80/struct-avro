@@ -2,6 +2,7 @@ package registry_test
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"testing"
 
@@ -118,4 +119,26 @@ func TestRegistryConcurrentGet(t *testing.T) {
 		}()
 	}
 	wg.Wait()
+}
+
+type stubFetcher struct{ schema string }
+
+func (s stubFetcher) Get(context.Context, string) (string, error) { return s.schema, nil }
+func (s stubFetcher) GetByDefinition(context.Context, avro.Schema) (string, error) {
+	return "", registry.ErrSchemaNotFound
+}
+
+func TestGetSchema_InvalidFetchedSchemaFailsWithoutPanic(t *testing.T) {
+	for name, body := range map[string]string{
+		"malformed":    `{"type":`,
+		"not a record": `"string"`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			reg := registry.New(stubFetcher{schema: body}, nil, fs.NewWireFormatter())
+			_, _, _, err := reg.GetSchema(context.Background(), "aaaaaaaaaaaaaaaa")
+			if !errors.Is(err, registry.ErrInvalidSchema) {
+				t.Fatalf("expect ErrInvalidSchema, got %v", err)
+			}
+		})
+	}
 }
