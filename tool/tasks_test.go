@@ -12,7 +12,7 @@ import (
 	"time"
 
 	avro "github.com/ln80/avro/v2"
-	stravro "github.com/ln80/struct-avro"
+	"github.com/ln80/struct-avro"
 	"github.com/ln80/struct-avro/fs"
 	bankv1 "github.com/ln80/struct-avro/testdata/v1"
 	"github.com/ln80/struct-avro/tool"
@@ -36,12 +36,12 @@ type envelope struct {
 
 func bankV1Schema(t *testing.T) *avro.RecordSchema {
 	t.Helper()
-	sch, err := stravro.BuildEnvelopeSchema(stravro.NewAPI(), stravro.EnvelopeConfig{
+	sch, err := structavro.BuildEnvelopeSchema(structavro.NewAPI(), structavro.EnvelopeConfig{
 		Namespace: "bank",
 		RootType:  reflect.TypeOf(envelope{}),
 		RootName:  "events",
 		InjectKey: "union",
-		Entries: []stravro.RecordEntry{
+		Entries: []structavro.RecordEntry{
 			{Name: "bank.AccountOpened", Type: reflect.TypeOf(bankv1.AccountOpened{}), Sample: bankv1.AccountOpened{}},
 			{Name: "bank.MoneyDeposited", Type: reflect.TypeOf(bankv1.MoneyDeposited{}), Sample: bankv1.MoneyDeposited{}},
 			{Name: "bank.MoneyWithdrawn", Type: reflect.TypeOf(bankv1.MoneyWithdrawn{}), Sample: bankv1.MoneyWithdrawn{}},

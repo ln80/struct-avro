@@ -1,4 +1,4 @@
-package avro
+package structavro
 
 import (
 	avro "github.com/ln80/avro/v2"

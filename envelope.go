@@ -1,4 +1,4 @@
-package avro
+package structavro
 
 import (
 	"fmt"
@@ -51,11 +51,17 @@ type EnvelopeConfig struct {
 // schema per entry (sharing a dedup cache and a fingerprint accumulator), wraps them
 // in a [null, ...records] union, and injects that union into the envelope RootType.
 //
-// It is a generic, event-store-independent reimplementation of event-store's
-// eventSchema; callers supply the entries (e.g. from their own event registry).
+// It also registers each entry on a (see RegisterEntries), so that decoding the
+// union returns the entry's Go type.
 func BuildEnvelopeSchema(a avro.API, cfg EnvelopeConfig) (*avro.RecordSchema, error) {
 	if len(cfg.Entries) == 0 {
-		return nil, fmt.Errorf("no record entries provided")
+		return nil, fmt.Errorf("%w: no record entries provided", ErrInvalidConfig)
+	}
+	if a == nil {
+		return nil, fmt.Errorf("%w: no API", ErrInvalidConfig)
+	}
+	if err := RegisterEntries(a, cfg.Entries); err != nil {
+		return nil, err
 	}
 	tagKey := cfg.TagKey
 	if tagKey == "" {
@@ -66,8 +72,8 @@ func BuildEnvelopeSchema(a avro.API, cfg EnvelopeConfig) (*avro.RecordSchema, er
 	if err != nil {
 		return nil, err
 	}
-	cache := NewCache()
-	acc := NewAccumulator()
+	cache := newCache()
+	acc := newAccumulator()
 	acc.names = names
 
 	schemas := make([]avro.Schema, 0, len(cfg.Entries)+1)
@@ -83,7 +89,7 @@ func BuildEnvelopeSchema(a avro.API, cfg EnvelopeConfig) (*avro.RecordSchema, er
 		aliases = structTypeAliases(tagKey, entry.Type, aliases)
 		aliases = unique(aliases)
 
-		schema, err := schemaOf(entry.Type, func(sc *Config) {
+		schema, err := schemaOf(entry.Type, func(sc *schemaConfig) {
 			sc.name = entry.Name
 			sc.namespace = cfg.Namespace
 			sc.def = def
@@ -127,7 +133,7 @@ func BuildEnvelopeSchema(a avro.API, cfg EnvelopeConfig) (*avro.RecordSchema, er
 		rootNS = "_"
 	}
 
-	sc, err := schemaOf(cfg.RootType, func(c *Config) {
+	sc, err := schemaOf(cfg.RootType, func(c *schemaConfig) {
 		c.inject = map[string]avro.Schema{cfg.InjectKey: unionSch}
 		c.namespace = rootNS
 		c.name = cfg.RootName
@@ -174,4 +180,24 @@ func UnpackUnionRecords(schema *avro.RecordSchema, fieldName string) ([]*avro.Re
 	}
 
 	return schemas, nil
+}
+
+// RegisterEntries registers each entry's Go type on a under the entry name, as a
+// value and as a pointer. Without it, a decoded union holds a map instead of the
+// Go type. BuildEnvelopeSchema calls it.
+func RegisterEntries(a avro.API, entries []RecordEntry) error {
+	for _, e := range entries {
+		if e.Name == "" || e.Type == nil {
+			return fmt.Errorf("%w: record entry needs a name and a type", ErrInvalidConfig)
+		}
+		if e.Type.Kind() != reflect.Struct {
+			return fmt.Errorf("%w: record entry %s: type %s is not a struct", ErrInvalidConfig, e.Name, e.Type)
+		}
+		if e.Sample != nil && reflect.TypeOf(e.Sample) != e.Type {
+			return fmt.Errorf("%w: record entry %s: sample is a %T, not a %s", ErrInvalidConfig, e.Name, e.Sample, e.Type)
+		}
+		a.Register(e.Name, reflect.Zero(e.Type).Interface())
+		a.Register(e.Name, reflect.New(e.Type).Interface())
+	}
+	return nil
 }

@@ -25,7 +25,7 @@ import (
 
 	_avro "github.com/ln80/avro/v2"
 	"github.com/ln80/avro/v2/gen"
-	stravro "github.com/ln80/struct-avro"
+	"github.com/ln80/struct-avro"
 	"github.com/ln80/struct-avro/fs"
 	"github.com/ln80/struct-avro/registry"
 	internal "github.com/ln80/struct-avro/tool/internal"
@@ -305,7 +305,7 @@ func (tt *CheckCompatibilityTask) Run(ctx context.Context, deps ...any) error {
 		return fmt.Errorf("failed to run '%s' walker not found", tt.Name())
 	}
 
-	compat := stravro.NewCompatibilityAPI()
+	compat := structavro.NewCompatibilityAPI()
 
 	_, err := tt.walker.Walk(ctx, func(id string, version int64, latest bool, schema *_avro.RecordSchema) error {
 		n := schema.Namespace()
@@ -409,7 +409,7 @@ func (tt *EmbedSchemasTask) Run(ctx context.Context, _ ...any) error {
 			return nil
 		}
 
-		records, err := stravro.UnpackUnionRecords(schema, tt.cfg.UnionField)
+		records, err := structavro.UnpackUnionRecords(schema, tt.cfg.UnionField)
 		if err != nil {
 			return err
 		}

@@ -16,7 +16,7 @@ import (
 	"sync"
 
 	"github.com/ln80/avro/v2"
-	stravro "github.com/ln80/struct-avro"
+	"github.com/ln80/struct-avro"
 )
 
 var (
@@ -147,7 +147,7 @@ func Open(ctx context.Context, store Fetcher, opts ...Option) (*Registry, error)
 		}
 	}
 	if o.api == nil {
-		o.api = stravro.NewAPI()
+		o.api = structavro.NewAPI()
 	}
 	if o.wireFormatter == nil {
 		wf, ok := store.(WireFormatter)

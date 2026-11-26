@@ -30,9 +30,9 @@ Go structs  →  SchemaOf / BuildEnvelopeSchema  →  Avro schema
 The optional `registry` package prefixes the schema ID onto those bytes, so a
 reader can look up the writer schema and resolve it against its current schema.
 
-`api.Register(fullName, value)` (register both the value and a pointer) is
-needed only when the payload is a **union**: without it, Avro decodes unknown
-union branches as maps instead of your Go structs.
+`BuildEnvelopeSchema` registers each record entry on the API (as a value and
+as a pointer). Without that, Avro decodes union branches as maps instead of
+your Go structs. `RegisterEntries` does the same on another API.
 
 What stayed in event-store: `EventSerializer` and the `avroEvent` envelope type
 (`event-store/avro/serializer.go`, `event.go`). Those compose this library’s
@@ -57,7 +57,7 @@ import (
 	"fmt"
 	"reflect"
 
-	stravro "github.com/ln80/struct-avro"
+	structavro "github.com/ln80/struct-avro"
 )
 
 type User struct {
@@ -66,16 +66,16 @@ type User struct {
 }
 
 func main() {
-	schema, err := stravro.SchemaOf(
+	schema, err := structavro.SchemaOf(
 		reflect.TypeOf(User{}),
-		stravro.WithName("User"),
-		stravro.WithNamespace("demo"),
+		structavro.WithName("User"),
+		structavro.WithNamespace("demo"),
 	)
 	if err != nil {
 		panic(err)
 	}
 
-	api := stravro.NewAPI()
+	api := structavro.NewAPI()
 
 	in := User{ID: "u1", Email: "a@example.com"}
 	b, err := api.Marshal(schema, in)
@@ -94,8 +94,7 @@ func main() {
 ## Example 2 — envelope union
 
 A root struct holds metadata plus a `Data` field whose schema is injected as a
-`[null, …records]` union. Register each record’s full name so unmarshal returns
-a concrete struct.
+`[null, …records]` union.
 
 ```go
 package main
@@ -104,7 +103,7 @@ import (
 	"fmt"
 	"reflect"
 
-	stravro "github.com/ln80/struct-avro"
+	structavro "github.com/ln80/struct-avro"
 )
 
 type Envelope struct {
@@ -124,9 +123,9 @@ type MoneyDeposited struct {
 }
 
 func main() {
-	api := stravro.NewAPI()
+	api := structavro.NewAPI()
 
-	entries := []stravro.RecordEntry{
+	entries := []structavro.RecordEntry{
 		{
 			Name:   "demo.AccountOpened",
 			Type:   reflect.TypeOf(AccountOpened{}),
@@ -139,15 +138,9 @@ func main() {
 		},
 	}
 
-	// Register value + pointer so the union resolver maps records to Go types.
-	for _, e := range entries {
-		api.Register(e.Name, e.Sample)
-		ptr := reflect.New(e.Type)
-		ptr.Elem().Set(reflect.ValueOf(e.Sample))
-		api.Register(e.Name, ptr.Interface())
-	}
-
-	schema, err := stravro.BuildEnvelopeSchema(api, stravro.EnvelopeConfig{
+	// BuildEnvelopeSchema also registers each entry on api, so the union
+	// decodes into the Go types below.
+	schema, err := structavro.BuildEnvelopeSchema(api, structavro.EnvelopeConfig{
 		Namespace: "demo",
 		RootType:  reflect.TypeOf(Envelope{}),
 		RootName:  "events",
@@ -248,7 +241,7 @@ import (
 	"os"
 	"reflect"
 
-	stravro "github.com/ln80/struct-avro"
+	structavro "github.com/ln80/struct-avro"
 	"github.com/ln80/struct-avro/fs"
 	"github.com/ln80/struct-avro/tool"
 )
@@ -260,12 +253,12 @@ func main() {
 	store := fs.NewDirAdapter("./schemas")
 
 	build := func(context.Context) (tool.SchemaMap, error) {
-		sch, err := stravro.BuildEnvelopeSchema(stravro.NewAPI(), stravro.EnvelopeConfig{
+		sch, err := structavro.BuildEnvelopeSchema(structavro.NewAPI(), structavro.EnvelopeConfig{
 			Namespace: "demo",
 			RootType:  reflect.TypeOf(Envelope{}),
 			RootName:  "events",
 			InjectKey: "union",
-			Entries: []stravro.RecordEntry{
+			Entries: []structavro.RecordEntry{
 				{Name: "demo.AccountOpened", Type: reflect.TypeOf(AccountOpened{}), Sample: AccountOpened{}},
 				{Name: "demo.MoneyDeposited", Type: reflect.TypeOf(MoneyDeposited{}), Sample: MoneyDeposited{}},
 			},
