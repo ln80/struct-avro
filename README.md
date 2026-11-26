@@ -249,7 +249,8 @@ import (
 func main() {
 	ctx := context.Background()
 
-	// The schema store: one folder per namespace, one "<version>@<id>.json" file per version.
+	// The schema store (the directory must exist): one folder per namespace,
+	// one "<version>@<id>.json" file per version.
 	store := fs.NewDirAdapter("./schemas")
 
 	build := func(context.Context) (tool.SchemaMap, error) {
