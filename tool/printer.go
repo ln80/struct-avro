@@ -36,25 +36,25 @@ type DefaultPrinter struct {
 
 // Task implements TaskPrinter.
 func (p *DefaultPrinter) Task(i int, t Task) {
-	fmt.Fprintf(p.Output, "%d. %s\n", i, t.Name())
+	_, _ = fmt.Fprintf(p.Output, "%d. %s\n", i, t.Name())
 }
 
 // Error implements TaskPrinter.
 func (p *DefaultPrinter) Error(err error, t *Task) {
 	if t == nil {
-		fmt.Fprintf(p.Err, "error: %v\n", err)
+		_, _ = fmt.Fprintf(p.Err, "error: %v\n", err)
 		return
 	}
-	fmt.Fprintf(p.Err, "%s: error: %v\n", (*t).Name(), err)
+	_, _ = fmt.Fprintf(p.Err, "%s: error: %v\n", (*t).Name(), err)
 }
 
 // Message implements TaskPrinter.
 func (p *DefaultPrinter) Message(msg string, t *Task) {
 	if t == nil {
-		fmt.Fprintf(p.Output, "%s\n", msg)
+		_, _ = fmt.Fprintf(p.Output, "%s\n", msg)
 		return
 	}
-	fmt.Fprintf(p.Output, "%s: %s\n", msg, (*t).Name())
+	_, _ = fmt.Fprintf(p.Output, "%s: %s\n", msg, (*t).Name())
 }
 
 var _ TaskPrinter = &DefaultPrinter{}

@@ -1,10 +1,12 @@
-package avro
+package structavro
 
 import (
 	"reflect"
 	"strconv"
 	"testing"
 	"time"
+
+	avro "github.com/ln80/avro/v2"
 )
 
 func TestDefaultOf(t *testing.T) {
@@ -161,5 +163,22 @@ func TestDefaultOf(t *testing.T) {
 				t.Fatalf("want %+#v, got %+#v", want, got)
 			}
 		})
+	}
+}
+
+func TestNewAPIBoundsArrayAllocation(t *testing.T) {
+	sch := avro.MustParse(`{"type":"array","items":"int"}`)
+	// Block header claiming 2^40 elements, followed by no data.
+	var b []byte
+	n := uint64(1) << 41 // zig-zag encoding of 2^40
+	for n >= 0x80 {
+		b = append(b, byte(n)|0x80)
+		n >>= 7
+	}
+	b = append(b, byte(n))
+
+	var out []int
+	if err := NewAPI().Unmarshal(sch, b, &out); err == nil {
+		t.Fatal("expect error for an oversized array length")
 	}
 }

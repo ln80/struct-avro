@@ -1,4 +1,4 @@
-package avro
+package structavro
 
 import (
 	"bytes"
@@ -11,7 +11,7 @@ import (
 	"github.com/ln80/avro/v2"
 )
 
-// Accumulator collects field defaults and sensitive-field descriptors encountered
+// accumulator collects field defaults and sensitive-field descriptors encountered
 // while walking the event records of an envelope. It emits two synthetic root fields
 // whose names embed a fingerprint of that metadata, so that any change to defaults or
 // sensitive annotations forces a schema change (and thus a new schema version).
@@ -19,15 +19,19 @@ import (
 // IMPORTANT: the byte layout fed to the hash is preserved exactly from the original
 // event-store implementation. Altering it would change the generated field names,
 // hence the schema bytes and the schema IDs used to decode persisted data.
-type Accumulator struct {
+type accumulator struct {
 	def       []byte
 	sensitive []string
+	names     FingerprintFields
 }
 
-// NewAccumulator returns an empty accumulator, shared across the SchemaOf calls of one envelope.
-func NewAccumulator() *Accumulator { return &Accumulator{} }
+// newAccumulator returns an empty accumulator, shared across the SchemaOf calls
+// of one envelope. It names its fields with the legacy prefixes.
+func newAccumulator() *accumulator {
+	return &accumulator{names: FingerprintFields{Defaults: LegacyDefaultsPrefix, Annotations: LegacyAnnotationsPrefix}}
+}
 
-func (a *Accumulator) appendDefault(def any) {
+func (a *accumulator) appendDefault(def any) {
 	if m, ok := def.(map[string]any); ok {
 		arr := make([][2]any, 0, len(m))
 		for k, v := range m {
@@ -44,11 +48,11 @@ func (a *Accumulator) appendDefault(def any) {
 	a.def = append(a.def, buf.Bytes()...)
 }
 
-func (a *Accumulator) appendSensitive(data string) {
+func (a *accumulator) appendSensitive(data string) {
 	a.sensitive = append(a.sensitive, data)
 }
 
-func (a *Accumulator) defaultField() *avro.Field {
+func (a *accumulator) defaultField() *avro.Field {
 	if a.def == nil {
 		return nil
 	}
@@ -57,11 +61,11 @@ func (a *Accumulator) defaultField() *avro.Field {
 
 	hash := sha3.Sum256(vv)
 	fingerprint := hex.EncodeToString(hash[:])
-	f, _ := avro.NewField("defxyz"+fingerprint, avro.NewPrimitiveSchema(avro.String, nil), avro.WithDefault(""))
+	f, _ := avro.NewField(a.names.Defaults+fingerprint, avro.NewPrimitiveSchema(avro.String, nil), avro.WithDefault(""))
 	return f
 }
 
-func (a *Accumulator) sensitiveField() *avro.Field {
+func (a *accumulator) sensitiveField() *avro.Field {
 	if a.sensitive == nil {
 		return nil
 	}
@@ -70,6 +74,6 @@ func (a *Accumulator) sensitiveField() *avro.Field {
 
 	hash := sha3.Sum256([]byte(strings.Join(vv, ".")))
 	fingerprint := hex.EncodeToString(hash[:])
-	f, _ := avro.NewField("sensitivexyz"+fingerprint, avro.NewPrimitiveSchema(avro.String, nil), avro.WithDefault(""))
+	f, _ := avro.NewField(a.names.Annotations+fingerprint, avro.NewPrimitiveSchema(avro.String, nil), avro.WithDefault(""))
 	return f
 }

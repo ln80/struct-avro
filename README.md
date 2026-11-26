@@ -1,44 +1,19 @@
 # struct-avro
 
-Go structs → Avro schemas, with envelope unions, schema persistence, and
-backward-compatible evolution.
+[![Go Reference](https://pkg.go.dev/badge/github.com/ln80/struct-avro.svg)](https://pkg.go.dev/github.com/ln80/struct-avro)
+[![Go Module](https://github.com/ln80/struct-avro/actions/workflows/module.yml/badge.svg)](https://github.com/ln80/struct-avro/actions/workflows/module.yml)
 
-Module: `github.com/ln80/struct-avro`
+Avro schemas from Go structs, with schema evolution you can rely on.
 
-This library generates Avro schemas from Go types, builds a root “envelope”
-record whose payload field is a union of record types, fingerprints defaults and
-`pii` annotations so schema IDs change when those change, and can persist /
-resolve schemas through a filesystem-backed registry. It does **not** encode or
-decode bytes itself.
+- `structavro`: generate a record schema from a Go type, or an envelope record
+  whose payload is a union of record types.
+- `registry`: frame a schema ID into each payload, and decode data written with
+  an older schema into the current one.
+- `fs`: a schema store on disk or in an `embed.FS`.
+- `tool`: check compatibility, persist new versions, and generate Go types and
+  an `embed.FS` from the stored versions.
 
-## Marshal and unmarshal
-
-Encoding lives in [`github.com/ln80/avro/v2`](https://github.com/ln80/avro).
-`NewAPI()` returns a configured `avro.API`; you call `Marshal` / `Unmarshal` on
-that API with a schema this library produced.
-
-```text
-Go structs  →  SchemaOf / BuildEnvelopeSchema  →  Avro schema
-                                                      │
-                                                      ▼
-                                            NewAPI().Marshal / Unmarshal
-                                                      │
-                                                      ▼
-                                                 Avro bytes
-```
-
-Optional schema-id framing (`fs.WireFormatter` + `registry.Registry`) prefixes
-the schema ID onto those bytes so a reader can look up the writer schema and
-resolve it against the current reader schema.
-
-`api.Register(fullName, value)` (register both the value and a pointer) is
-needed only when the payload is a **union**: without it, Avro decodes unknown
-union branches as maps instead of your Go structs.
-
-What stayed in event-store: `EventSerializer` and the `avroEvent` envelope type
-(`event-store/avro/serializer.go`, `event.go`). Those compose this library’s
-API + registry with `event.Envelope`. You do not need them to use struct-avro
-standalone.
+Encoding uses [`github.com/ln80/avro/v2`](https://github.com/ln80/avro).
 
 ## Install
 
@@ -46,261 +21,100 @@ standalone.
 go get github.com/ln80/struct-avro
 ```
 
-## Example 1 — one record
+Go 1.25 or later.
 
-Flat struct, no envelope, no registry. `avro` tags are not used here: field-name
-overrides via `` `avro:"..."` `` apply only on the envelope root.
-
-```go
-package main
-
-import (
-	"fmt"
-	"reflect"
-
-	stravro "github.com/ln80/struct-avro"
-)
-
-type User struct {
-	ID    string
-	Email string
-}
-
-func main() {
-	schema, err := stravro.SchemaOf(
-		reflect.TypeOf(User{}),
-		stravro.WithName("User"),
-		stravro.WithNamespace("demo"),
-	)
-	if err != nil {
-		panic(err)
-	}
-
-	api := stravro.NewAPI()
-
-	in := User{ID: "u1", Email: "a@example.com"}
-	b, err := api.Marshal(schema, in)
-	if err != nil {
-		panic(err)
-	}
-
-	var out User
-	if err := api.Unmarshal(schema, b, &out); err != nil {
-		panic(err)
-	}
-	fmt.Printf("%+v\n", out)
-}
-```
-
-## Example 2 — envelope union
-
-A root struct holds metadata plus a `Data` field whose schema is injected as a
-`[null, …records]` union. Register each record’s full name so unmarshal returns
-a concrete struct.
+## Usage
 
 ```go
-package main
-
-import (
-	"fmt"
-	"reflect"
-
-	stravro "github.com/ln80/struct-avro"
-)
-
 type Envelope struct {
 	ID   string `avro:"ID"`
-	Type string `avro:"Type"`
 	Data any    `avro:"Data" ev:",inject=union"`
 }
 
 type AccountOpened struct {
 	AccountID string
-	Owner     string
+	Owner     string `pii:"data"`
 }
 
-type MoneyDeposited struct {
-	AccountID string
-	Amount    int
-}
+api := structavro.NewAPI()
+schema, err := structavro.BuildEnvelopeSchema(api, structavro.EnvelopeConfig{
+	Namespace: "bank",
+	RootType:  reflect.TypeOf(Envelope{}),
+	RootName:  "events",
+	InjectKey: "union",
+	Entries: []structavro.RecordEntry{
+		{Name: "bank.AccountOpened", Type: reflect.TypeOf(AccountOpened{})},
+	},
+})
 
-func main() {
-	api := stravro.NewAPI()
-
-	entries := []stravro.RecordEntry{
-		{
-			Name:   "demo.AccountOpened",
-			Type:   reflect.TypeOf(AccountOpened{}),
-			Sample: AccountOpened{},
-		},
-		{
-			Name:   "demo.MoneyDeposited",
-			Type:   reflect.TypeOf(MoneyDeposited{}),
-			Sample: MoneyDeposited{},
-		},
-	}
-
-	// Register value + pointer so the union resolver maps records to Go types.
-	for _, e := range entries {
-		api.Register(e.Name, e.Sample)
-		ptr := reflect.New(e.Type)
-		ptr.Elem().Set(reflect.ValueOf(e.Sample))
-		api.Register(e.Name, ptr.Interface())
-	}
-
-	schema, err := stravro.BuildEnvelopeSchema(api, stravro.EnvelopeConfig{
-		Namespace: "demo",
-		RootType:  reflect.TypeOf(Envelope{}),
-		RootName:  "events",
-		InjectKey: "union",
-		Entries:   entries,
-		Validate:  true,
-	})
-	if err != nil {
-		panic(err)
-	}
-
-	in := Envelope{
-		ID:   "evt-1",
-		Type: "demo.AccountOpened",
-		Data: AccountOpened{AccountID: "acc-1", Owner: "alice"},
-	}
-	b, err := api.Marshal(schema, in)
-	if err != nil {
-		panic(err)
-	}
-
-	var out Envelope
-	if err := api.Unmarshal(schema, b, &out); err != nil {
-		panic(err)
-	}
-
-	opened := out.Data.(*AccountOpened)
-	fmt.Printf("%s %+v\n", out.Type, opened)
-}
-```
-
-## Schema ID framing (optional)
-
-After marshal, prefix the schema ID. Before unmarshal, extract it and resolve
-the schema through the registry. `GetSchema` resolves an older writer schema
-against the current reader schema when `Setup` has installed one. That is the
-rest of the old event-store serializer (minus `event.Envelope`).
-
-```go
-import (
-	"github.com/ln80/struct-avro/fs"
-	"github.com/ln80/struct-avro/registry"
+// Schemas are persisted ahead of deployment (see Tooling) and embedded.
+reg, err := registry.Open(ctx, fs.NewAdapter(events.EmbedFS(), ""),
+	registry.WithAPI(api),
+	registry.WithCurrent(schema),
 )
 
-wf := fs.NewWireFormatter()
-framed, err := wf.AppendSchemaID(payload, schemaID)
+b, err := reg.Encode(Envelope{ID: "1", Data: AccountOpened{AccountID: "a1", Owner: "Ada"}})
 
-id, raw, err := wf.ExtractSchemaID(framed)
-_, schema, _, err := reg.GetSchema(ctx, id)
-err = api.Unmarshal(schema, raw, &dest)
+var out Envelope
+_, err = reg.Decode(ctx, b, &out) // out.Data is *AccountOpened
 ```
 
-Typical wiring: `fs.NewDirAdapter(dir)` as both `Fetcher` and `Persister`, then
-`registry.New(adapter, adapter, fs.NewWireFormatter())`, then
-`reg.Setup(ctx, currentSchema, …)`.
+`registry.Open` fails if the store does not hold the current schema. Data
+written with an older version is resolved against the current one when decoded.
+A reader that handles every namespace and has no current schema uses
+`registry.WithLatestReader()` to decode into the latest stored schema of each
+namespace.
 
-## Tooling — generate, check, persist, embed
+## Tags
 
-The `tool` package runs schema maintenance as a job, typically from a small
-`go run ./cmd/schemas` command in CI or before a release. You supply the current
-schemas (one envelope per namespace); the job does the rest, always in this
-order:
+| Tag | Effect |
+|---|---|
+| `ev:",aliases=Old"` | Field renamed from `Old`. On a blank `_` field: record renamed. |
+| `ev:",inject=<key>"` | On the envelope: the field holding the record union. |
+| `avro:"Name"` | On the envelope: the Avro field name. |
+| `pii`, `sensitive`, `sens` | [struct-sensitive](https://github.com/ln80/struct-sensitive) tags, kept in the schema as the `sensitive` property. Set `EnvelopeConfig.Annotator` to read other tags. |
 
-1. **GenerateSchemas** — calls your `SchemaBuilder` to produce the current schema
-   of each namespace.
-2. **CheckCompatibility** — walks every persisted version of each namespace and
-   fails if the current schema cannot read data written with *any* of them
-   (backward, transitive).
-3. **PersistSchemas** — stores the current schema as a new version, unless a
-   schema with the same fingerprint already exists.
-4. **EmbedSchemas** — copies every version into `Out/<namespace>/`, generates Go
-   types from the latest version of each namespace (`Out/<namespace>/events.go`),
-   and writes `Out/init.go`, which exposes all versions as an `embed.FS`.
+A change to a field default or annotation changes the schema ID, so it is
+persisted as a new version.
+
+## Tooling
 
 ```go
-package main
+store := fs.NewDirAdapter("./schemas") // must exist
 
-import (
-	"context"
-	"log"
-	"os"
-	"reflect"
+err := tool.NewJobExecuter(nil).
+	GenerateSchemas(build). // func(ctx) (tool.SchemaMap, error)
+	CheckCompatibility(store).
+	PersistSchemas(store, store).
+	EmbedSchemas(store, tool.EmbedConfig{Out: "./gen/events"}).
+	Execute(ctx)
+```
 
-	stravro "github.com/ln80/struct-avro"
-	"github.com/ln80/struct-avro/fs"
-	"github.com/ln80/struct-avro/tool"
-)
+The job fails if the current schema cannot read every stored version. It
+writes `gen/events/<namespace>/<version>@<id>.json`, `<namespace>/events.go`
+and `embed.go`. Versions in file names are zero-padded (`0001@…`) so that a
+directory listing is in version order; unpadded names from earlier versions are
+read, and renamed when the tool copies them.
 
-func main() {
-	ctx := context.Background()
+## Testing a store
 
-	// The schema store: one folder per namespace, one "<version>@<id>.json" file per version.
-	store := fs.NewDirAdapter("./schemas")
+A schema store passes `registrytest.Run` against real storage:
 
-	build := func(context.Context) (tool.SchemaMap, error) {
-		sch, err := stravro.BuildEnvelopeSchema(stravro.NewAPI(), stravro.EnvelopeConfig{
-			Namespace: "demo",
-			RootType:  reflect.TypeOf(Envelope{}),
-			RootName:  "events",
-			InjectKey: "union",
-			Entries: []stravro.RecordEntry{
-				{Name: "demo.AccountOpened", Type: reflect.TypeOf(AccountOpened{}), Sample: AccountOpened{}},
-				{Name: "demo.MoneyDeposited", Type: reflect.TypeOf(MoneyDeposited{}), Sample: MoneyDeposited{}},
-			},
-			Validate: true,
-		})
-		if err != nil {
-			return nil, err
-		}
-		return tool.SchemaMap{"demo": sch}, nil
-	}
-
-	err := tool.NewJobExecuter(&tool.DefaultPrinter{Output: os.Stdout, Err: os.Stderr}).
-		GenerateSchemas(build).
-		CheckCompatibility(store).
-		PersistSchemas(store, store).
-		EmbedSchemas(store, fs.NewDirAdapter("./gen/events"), tool.EmbedConfig{Out: "./gen/events"}).
-		Execute(ctx)
-	if err != nil {
-		log.Fatal(err)
-	}
+```go
+func TestStore(t *testing.T) {
+	registrytest.Run(t, func(t *testing.T) registrytest.Store { return newStore(t) })
 }
 ```
 
-(`Envelope`, `AccountOpened` and `MoneyDeposited` are the types from Example 2.)
+## Development
 
-Notes:
+```bash
+make test lint security fuzz
+```
 
-- Versions are numbered per namespace (`1@…`, `2@…`, …). "Latest" is the highest
-  number, not the last file name in lexical order (`9@` < `12@`).
-- The printer is optional: `tool.NewJobExecuter(nil)` runs silently
-  (`tool.NoPrinter`). Implement `tool.TaskPrinter` for custom output.
-- The generated types are plain structs with `avro` (and `pii`) tags. They give
-  a consumer, such as a projection, the latest shape of another namespace's
-  events without importing the package that owns them. Readers decode older
-  versions through the registry, which resolves each writer schema against the
-  reader schema.
-- `EmbedConfig.Template` replaces the code-generation template, e.g. to add an
-  `init()` that registers the generated types with your own event registry.
-  `EmbedConfig.UnionField` names the envelope field holding the union (default
-  `Data`), and `EmbedConfig.Module` optionally makes `Out` its own Go module.
+See [SECURITY.md](SECURITY.md) to report a vulnerability, and
+[CHANGELOG.md](CHANGELOG.md) for changes.
 
-## Notes
+## License
 
-- Pointer fields become Avro `[null, T]` unions; nil maps to null.
-- `time.Time` maps to `long` with logical type timestamp-millis.
-- Go `int` / `int32` / small unsigned ints map to Avro `int`; `int64` to `long`.
-- Field defaults come from the Go zero value unless `RecordEntry.Sample` (or
-  `WithDefault`) supplies a richer sample.
-- Rename a field for readers with `` `ev:",aliases=OldName"` `` on the new field.
-- Changing a field default or a `pii` / sensitive annotation changes synthetic
-  fingerprint fields on the envelope, which changes the schema ID.
-- Integer / duration mappings in `schemaOfPrimitives` are intentionally frozen
-  for wire compatibility with already-persisted data; do not change them without
-  an explicit schema migration.
+[Apache 2.0](LICENSE)

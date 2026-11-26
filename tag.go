@@ -1,4 +1,4 @@
-package avro
+package structavro
 
 import (
 	"reflect"
@@ -11,16 +11,16 @@ import (
 // that structs annotated for event-store keep working unchanged.
 const DefaultTagKey = "ev"
 
-// TagOptions is a map of a field's tag options. Each option may hold multiple values.
-type TagOptions map[string][]string
+// tagOptions is a map of a field's tag options. Each option may hold multiple values.
+type tagOptions map[string][]string
 
 // parseTag returns the field name override and the option map encoded in the
 // struct tag under key. Format: `key:"name,opt1=a b,opt2"`.
 //
 // This is a self-contained copy of event-store's event.ParseTag (with a
 // configurable key) so the library does not depend on event-store.
-func parseTag(key string, tag reflect.StructTag) (name string, opts TagOptions) {
-	opts = make(TagOptions)
+func parseTag(key string, tag reflect.StructTag) (name string, opts tagOptions) {
+	opts = make(tagOptions)
 	tagStr := tag.Get(key)
 	if tagStr == "" {
 		return

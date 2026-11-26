@@ -37,8 +37,9 @@ func (t *task) String() string {
 	return str
 }
 
-func NewTask(name string) Task {
-	return &task{name: name, dependsOn: make([]string, 0)}
+// NewTask returns a task named name that runs after the tasks in dependsOn.
+func NewTask(name string, dependsOn ...string) Task {
+	return &task{name: name, dependsOn: append([]string{}, dependsOn...)}
 }
 
 func TaskFrom[T any](ts []Task) T {

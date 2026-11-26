@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -40,7 +41,36 @@ func NewDirAdapter(dir string) *Adapter {
 	return NewAdapter(os.DirFS(dir), dir)
 }
 
-// parseSchemaPath extracts (version, namespace, id) from a "<ns>/<version>@<id>.json" path.
+// validID reports whether id is a schema ID this adapter writes: the lowercase
+// hex encoding of an 8-byte fingerprint. It is checked before an ID is used in a
+// glob pattern, because an ID read from stored bytes may hold '*', '?' or '['.
+func validID(id string) bool {
+	if len(id) != schemaIDLen {
+		return false
+	}
+	for i := 0; i < len(id); i++ {
+		c := id[i]
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+// versionDigits is the width versions are zero-padded to in file names, so
+// that names sort in version order: 0009@… before 0010@…. A version above
+// 9999 is written with more digits and still read correctly; only the
+// listing order of such files is affected.
+const versionDigits = 4
+
+// schemaFileName returns the file name of a stored schema version.
+func schemaFileName(version int, id string) string {
+	return fmt.Sprintf("%0*d@%s.json", versionDigits, version, id)
+}
+
+// parseSchemaPath extracts (version, namespace, id) from a "<ns>/<version>@<id>.json"
+// path. The version may be zero-padded ("0007") or not ("7", written by
+// earlier versions of this package).
 func parseSchemaPath(path string) (version int64, namespace, id string, err error) {
 	splits := strings.Split(path, "/")
 	if len(splits) < 2 {
@@ -55,12 +85,24 @@ func parseSchemaPath(path string) (version int64, namespace, id string, err erro
 		err = fmt.Errorf("invalid schema path: '%s' missing version separator", path)
 		return
 	}
-	version, err = strconv.ParseInt(strings.TrimSpace(at[0]), 10, 64)
+	if at[0] == "" || len(at[0]) > 18 || strings.Trim(at[0], "0123456789") != "" {
+		err = fmt.Errorf("invalid schema path: '%s' version must be decimal digits", path)
+		return
+	}
+	version, err = strconv.ParseInt(at[0], 10, 64)
 	if err != nil {
 		err = fmt.Errorf("invalid schema path: '%s' bad version: %w", path, err)
 		return
 	}
-	id = strings.TrimSpace(strings.TrimSuffix(at[1], ".json"))
+	if version < 1 {
+		err = fmt.Errorf("invalid schema path: '%s' version must be positive", path)
+		return
+	}
+	id = strings.TrimSuffix(at[1], ".json")
+	if !validID(id) {
+		err = fmt.Errorf("%w: invalid schema path: '%s'", registry.ErrInvalidSchemaID, path)
+		return
+	}
 	return
 }
 
@@ -84,27 +126,47 @@ func maxVersionAmong(matches []string) (int64, error) {
 
 // Persist implements registry.Persister.
 func (p *Adapter) Persist(ctx context.Context, schema *avro.RecordSchema, opts ...func(*registry.PersistConfig)) (string, error) {
-	if _, err := os.Stat(p.dir); os.IsNotExist(err) {
-		return "", err
+	if _, err := os.Stat(p.dir); err != nil {
+		return "", fmt.Errorf("%w: %w", registry.ErrCreateOrUpdateSchemaFailed, err)
 	}
 
 	namespace := schema.Namespace()
 	dir := filepath.Join(p.dir, namespace)
 
-	if _, err := os.Stat(dir); os.IsNotExist(err) {
-		if err := os.MkdirAll(dir, 0o750); err != nil {
-			return "", err
-		}
+	if err := os.MkdirAll(dir, 0o750); err != nil {
+		return "", fmt.Errorf("%w: %w", registry.ErrCreateOrUpdateSchemaFailed, err)
 	}
 
 	cfg := &registry.PersistConfig{
 		Resolver: func(schema *avro.RecordSchema) (id string, version int, err error) {
-			fingerprint, _ := schema.FingerprintUsing(avro.CRC64Avro)
-			id = hex.EncodeToString(fingerprint[:])
+			var fingerprint []byte
+			fingerprint, err = schema.FingerprintUsing(avro.CRC64Avro)
+			if err != nil {
+				return
+			}
+			id = hex.EncodeToString(fingerprint)
 			version = 1
 
+			// Writes go to dir, so versions are read from dir too, not from
+			// p.fs (which may be an embedded copy).
+			stored := os.DirFS(p.dir)
+
+			// The ID is the canonical fingerprint: a schema already stored
+			// keeps its version instead of being stored again.
+			var same []string
+			same, err = fs.Glob(stored, schema.Namespace()+"/*@"+id+".json")
+			if err != nil {
+				return
+			}
+			if len(same) > 0 {
+				var v int64
+				v, _, _, err = parseSchemaPath(same[0])
+				version = int(v)
+				return
+			}
+
 			var matches []string
-			matches, err = fs.Glob(p.fs, schema.Namespace()+"/*@*.json")
+			matches, err = fs.Glob(stored, schema.Namespace()+"/*@*.json")
 			if err != nil {
 				return
 			}
@@ -133,12 +195,12 @@ func (p *Adapter) Persist(ctx context.Context, schema *avro.RecordSchema, opts .
 		return "", err
 	}
 
-	path := filepath.Clean(filepath.Join(dir, strconv.Itoa(version)+"@"+id+".json"))
-	file, err := os.Create(path)
-	if err != nil {
-		return "", err
+	if !validID(id) {
+		return "", fmt.Errorf("%w: resolver returned an invalid ID", registry.ErrInvalidSchemaID)
 	}
-	defer file.Close()
+	if version < 1 {
+		return "", fmt.Errorf("%w: resolver returned version %d", registry.ErrCreateOrUpdateSchemaFailed, version)
+	}
 
 	b, err := schema.MarshalJSON()
 	if err != nil {
@@ -149,8 +211,62 @@ func (p *Adapter) Persist(ctx context.Context, schema *avro.RecordSchema, opts .
 		return "", err
 	}
 
-	if _, err := file.Write(pretty.Bytes()); err != nil {
+	name := schemaFileName(version, id)
+	path := filepath.Clean(filepath.Join(dir, name))
+
+	// Look for this version under any file name: padded or, from older
+	// versions of this package, unpadded.
+	stored, err := fs.Glob(os.DirFS(dir), "*@*.json")
+	if err != nil {
 		return "", err
+	}
+	var sameVersion []string
+	for _, other := range stored {
+		v, _, otherID, err := parseSchemaPath(namespace + "/" + other)
+		if err != nil {
+			return "", fmt.Errorf("%w: %w", registry.ErrCreateOrUpdateSchemaFailed, err)
+		}
+		if v != int64(version) {
+			continue
+		}
+		if otherID != id {
+			return "", fmt.Errorf("%w: %s/%d is already stored as %s", registry.ErrCreateOrUpdateSchemaFailed, namespace, version, other)
+		}
+		sameVersion = append(sameVersion, other)
+	}
+	if len(sameVersion) > 1 {
+		return "", fmt.Errorf("%w: %s/%d is stored more than once", registry.ErrCreateOrUpdateSchemaFailed, namespace, version)
+	}
+	if len(sameVersion) == 1 && sameVersion[0] != name {
+		// Stored under an unpadded name. Rename it when it holds the same
+		// schema, so file names sort in version order.
+		legacy := filepath.Join(dir, sameVersion[0])
+		same, err := sameSchemaFile(legacy, b)
+		if err != nil {
+			return "", fmt.Errorf("%w: %w", registry.ErrCreateOrUpdateSchemaFailed, err)
+		}
+		if !same {
+			return "", fmt.Errorf("%w: %s holds a different schema", registry.ErrCreateOrUpdateSchemaFailed, sameVersion[0])
+		}
+		if err := os.Rename(legacy, path); err != nil {
+			return "", fmt.Errorf("%w: %w", registry.ErrCreateOrUpdateSchemaFailed, err)
+		}
+		return id, nil
+	}
+
+	if err := writeNewFile(path, pretty.Bytes()); err != nil {
+		if !errors.Is(err, fs.ErrExist) {
+			return "", fmt.Errorf("%w: %w", registry.ErrCreateOrUpdateSchemaFailed, err)
+		}
+		// The same version and ID is stored already. Persisting it again is a
+		// no-op when the schema is the same, and an error otherwise.
+		same, err := sameSchemaFile(path, b)
+		if err != nil {
+			return "", fmt.Errorf("%w: %w", registry.ErrCreateOrUpdateSchemaFailed, err)
+		}
+		if !same {
+			return "", fmt.Errorf("%w: %s holds a different schema", registry.ErrCreateOrUpdateSchemaFailed, name)
+		}
 	}
 
 	return id, nil
@@ -158,8 +274,50 @@ func (p *Adapter) Persist(ctx context.Context, schema *avro.RecordSchema, opts .
 
 var _ registry.Persister = &Adapter{}
 
+// sameSchemaFile reports whether the schema stored at path has the same
+// canonical form and properties as the JSON schema b.
+func sameSchemaFile(path string, b []byte) (bool, error) {
+	stored, err := os.ReadFile(path) // #nosec G304 -- path is built from a validated version and ID under the adapter dir
+	if err != nil {
+		return false, err
+	}
+	var x, y any
+	if err := json.Unmarshal(stored, &x); err != nil {
+		return false, fmt.Errorf("%w: %s: %w", registry.ErrInvalidSchema, filepath.Base(path), err)
+	}
+	if err := json.Unmarshal(b, &y); err != nil {
+		return false, err
+	}
+	xb, _ := json.Marshal(x)
+	yb, _ := json.Marshal(y)
+	return bytes.Equal(xb, yb), nil
+}
+
+// writeNewFile writes b to a file that must not exist yet. A version is written
+// once: an existing file means another writer took that version, and is never
+// overwritten. On a failed write the partial file is removed.
+func writeNewFile(path string, b []byte) (err error) {
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644) // #nosec G302 G304 -- schemas are committed source, not secrets; path is built from a validated version and ID under the adapter dir
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if cerr := file.Close(); err == nil {
+			err = cerr
+		}
+		if err != nil {
+			_ = os.Remove(path)
+		}
+	}()
+	_, err = file.Write(b)
+	return err
+}
+
 // Get implements registry.Fetcher.
 func (f *Adapter) Get(ctx context.Context, id string) (string, error) {
+	if !validID(id) {
+		return "", registry.ErrInvalidSchemaID
+	}
 	matches, err := fs.Glob(f.fs, "*/*@"+id+".json")
 	if err != nil {
 		return "", err
@@ -168,12 +326,15 @@ func (f *Adapter) Get(ctx context.Context, id string) (string, error) {
 	if len(matches) == 0 {
 		return "", fmt.Errorf("%w: %s", registry.ErrSchemaNotFound, id)
 	}
+	if len(matches) > 1 {
+		return "", fmt.Errorf("%w: schema %s is stored more than once", registry.ErrInvalidSchema, id)
+	}
 
 	file, err := f.fs.Open(matches[0])
 	if err != nil {
 		return "", err
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 
 	b, err := io.ReadAll(file)
 	if err != nil {
@@ -215,7 +376,7 @@ func (f *Adapter) readSchema(path string) (id string, schema avro.Schema, err er
 	if err != nil {
 		return "", nil, err
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 
 	b, err := io.ReadAll(file)
 	if err != nil {
@@ -223,7 +384,7 @@ func (f *Adapter) readSchema(path string) (id string, schema avro.Schema, err er
 	}
 	schema, err = avro.ParseBytes(b)
 	if err != nil {
-		return "", nil, err
+		return "", nil, fmt.Errorf("%w: %s: %w", registry.ErrInvalidSchema, path, err)
 	}
 	_, _, id, err = parseSchemaPath(path)
 	return id, schema, err
@@ -296,8 +457,12 @@ func (f *Adapter) Walk(ctx context.Context, fn func(id string, version int64, la
 			return 0, err
 		}
 
+		rec, ok := sch.(*avro.RecordSchema)
+		if !ok {
+			return 0, fmt.Errorf("%w: %s is not a record", registry.ErrInvalidSchema, e.path)
+		}
 		latest := e.version == maxByNS[e.namespace]
-		if err := fn(e.id, e.version, latest, sch.(*avro.RecordSchema)); err != nil {
+		if err := fn(e.id, e.version, latest, rec); err != nil {
 			return 0, err
 		}
 
@@ -314,10 +479,10 @@ type WireFormatter struct{}
 
 // AppendSchemaID implements registry.WireFormatter.
 func (*WireFormatter) AppendSchemaID(data []byte, id string) ([]byte, error) {
-	bid := []byte(id)
-	if len(bid) != schemaIDLen {
-		return nil, fmt.Errorf("%w: expected length %d, got %d", registry.ErrInvalidSchemaID, schemaIDLen, len(bid))
+	if !validID(id) {
+		return nil, fmt.Errorf("%w: expected %d lowercase hex characters", registry.ErrInvalidSchemaID, schemaIDLen)
 	}
+	bid := []byte(id)
 
 	out := make([]byte, 0, schemaIDLen+len(data))
 	out = append(out, bid...)
@@ -331,7 +496,11 @@ func (*WireFormatter) ExtractSchemaID(data []byte) (string, []byte, error) {
 		return "", nil, fmt.Errorf("%w: data too short", registry.ErrInvalidDataWireFormat)
 	}
 
-	return string(data[0:schemaIDLen]), data[schemaIDLen:], nil
+	id := string(data[0:schemaIDLen])
+	if !validID(id) {
+		return "", nil, fmt.Errorf("%w: invalid schema ID prefix", registry.ErrInvalidDataWireFormat)
+	}
+	return id, data[schemaIDLen:], nil
 }
 
 func NewWireFormatter() *WireFormatter {
@@ -339,3 +508,16 @@ func NewWireFormatter() *WireFormatter {
 }
 
 var _ registry.WireFormatter = &WireFormatter{}
+
+// AppendSchemaID implements registry.WireFormatter with WireFormatter, so an
+// Adapter is a complete store for registry.Open.
+func (*Adapter) AppendSchemaID(data []byte, id string) ([]byte, error) {
+	return (&WireFormatter{}).AppendSchemaID(data, id)
+}
+
+// ExtractSchemaID implements registry.WireFormatter with WireFormatter.
+func (*Adapter) ExtractSchemaID(data []byte) (string, []byte, error) {
+	return (&WireFormatter{}).ExtractSchemaID(data)
+}
+
+var _ registry.WireFormatter = &Adapter{}

@@ -1,4 +1,4 @@
-package avro
+package structavro
 
 import (
 	"errors"
@@ -8,19 +8,27 @@ import (
 	"time"
 
 	avro "github.com/ln80/avro/v2"
-	sensitive "github.com/ln80/struct-sensitive"
 )
 
-// Cache deduplicates named (record) schemas while walking a struct tree, so that a
+var (
+	// ErrInvalidTag is returned when a struct field carries a tag that cannot
+	// be parsed, or that its FieldAnnotator rejects.
+	ErrInvalidTag = errors.New("invalid struct tag")
+	// ErrInvalidConfig is returned for an option or configuration value that
+	// cannot be used.
+	ErrInvalidConfig = errors.New("invalid configuration")
+)
+
+// schemaCache deduplicates named (record) schemas while walking a struct tree, so that a
 // type referenced more than once is emitted once and referenced via a RefSchema.
-type Cache map[string]avro.NamedSchema
+type schemaCache map[string]avro.NamedSchema
 
-// NewCache returns an empty schema dedup cache, shareable across several SchemaOf
+// newCache returns an empty schema dedup cache, shareable across several SchemaOf
 // calls that belong to the same logical schema (e.g. events in one envelope).
-func NewCache() Cache { return make(Cache) }
+func newCache() schemaCache { return make(schemaCache) }
 
-// Config controls a single SchemaOf invocation. Use the With* options to set it.
-type Config struct {
+// schemaConfig controls a single SchemaOf invocation. The With* options set it.
+type schemaConfig struct {
 	// name forces the record schema name (used for the root envelope).
 	name string
 	// namespace given to the record schema.
@@ -35,50 +43,42 @@ type Config struct {
 	// aliases to add to the resolved schema.
 	aliases []string
 	// cache deduplicates generated named schemas.
-	cache Cache
+	cache schemaCache
 	// isEvent marks record schemas that represent an event (emitted as a custom prop).
 	isEvent bool
 	// root marks the top-level (envelope) schema vs nested ones.
 	root bool
 	// acc accumulates defaults/sensitive metadata while walking, to emit the
 	// envelope-level fingerprint fields.
-	acc *Accumulator
+	acc *accumulator
+	// annotate returns the annotation of each struct field. nil means SensitiveTags.
+	annotate FieldAnnotator
 }
 
 // Option configures a SchemaOf call.
-type Option func(*Config)
+type Option func(*schemaConfig)
 
-func WithName(name string) Option           { return func(c *Config) { c.name = name } }
-func WithNamespace(ns string) Option        { return func(c *Config) { c.namespace = ns } }
-func WithDefault(def any) Option            { return func(c *Config) { c.def = def } }
-func WithAliases(aliases []string) Option   { return func(c *Config) { c.aliases = aliases } }
-func WithCache(cache Cache) Option          { return func(c *Config) { c.cache = cache } }
-func WithAccumulator(a *Accumulator) Option { return func(c *Config) { c.acc = a } }
-func WithEvent(isEvent bool) Option         { return func(c *Config) { c.isEvent = isEvent } }
-func WithRoot(root bool) Option             { return func(c *Config) { c.root = root } }
-func WithTagKey(key string) Option          { return func(c *Config) { c.tagKey = key } }
+func WithName(name string) Option         { return func(c *schemaConfig) { c.name = name } }
+func WithNamespace(ns string) Option      { return func(c *schemaConfig) { c.namespace = ns } }
+func WithDefault(def any) Option          { return func(c *schemaConfig) { c.def = def } }
+func WithAliases(aliases []string) Option { return func(c *schemaConfig) { c.aliases = aliases } }
+func WithTagKey(key string) Option        { return func(c *schemaConfig) { c.tagKey = key } }
 
-// WithInject substitutes the given schema for fields tagged `ev:",inject=<key>"`.
-func WithInject(key string, schema avro.Schema) Option {
-	return func(c *Config) {
-		if c.inject == nil {
-			c.inject = make(map[string]avro.Schema)
-		}
-		c.inject[key] = schema
-	}
-}
+// WithFieldAnnotator sets how struct fields are annotated. The default is
+// SensitiveTags; NoAnnotations turns annotations off.
+func WithFieldAnnotator(fn FieldAnnotator) Option { return func(c *schemaConfig) { c.annotate = fn } }
 
 // SchemaOf generates the AVRO schema for a Go type.
 func SchemaOf(t reflect.Type, opts ...Option) (avro.Schema, error) {
-	cfgOpts := make([]func(*Config), 0, len(opts))
+	cfgOpts := make([]func(*schemaConfig), 0, len(opts))
 	for _, o := range opts {
 		cfgOpts = append(cfgOpts, o)
 	}
 	return schemaOf(t, cfgOpts...)
 }
 
-func schemaOf(t reflect.Type, opts ...func(*Config)) (avro.Schema, error) {
-	cfg := &Config{
+func schemaOf(t reflect.Type, opts ...func(*schemaConfig)) (avro.Schema, error) {
+	cfg := &schemaConfig{
 		inject: make(map[string]avro.Schema),
 		tagKey: DefaultTagKey,
 		def:    nil,
@@ -93,14 +93,15 @@ func schemaOf(t reflect.Type, opts ...func(*Config)) (avro.Schema, error) {
 		cfg.tagKey = DefaultTagKey
 	}
 
-	// the basic Config to pass down to complex child fields
-	childOpt := func(sc *Config) {
+	// the basic schemaConfig to pass down to complex child fields
+	childOpt := func(sc *schemaConfig) {
 		sc.tagKey = cfg.tagKey
 		sc.inject = cfg.inject
 		sc.namespace = cfg.namespace
 		sc.cache = cfg.cache
 		sc.root = false
 		sc.acc = cfg.acc
+		sc.annotate = cfg.annotate
 	}
 
 	avroOpts := make([]avro.SchemaOption, 0)
@@ -205,7 +206,7 @@ func schemaOfPrimitives(t reflect.Type, avroOpts []avro.SchemaOption) (avro.Sche
 }
 
 // schemaOfStruct generates the schema of the given struct type.
-func schemaOfStruct(t reflect.Type, avroOpts []avro.SchemaOption, cfg *Config, childOpt func(*Config)) (avro.Schema, error) {
+func schemaOfStruct(t reflect.Type, avroOpts []avro.SchemaOption, cfg *schemaConfig, childOpt func(*schemaConfig)) (avro.Schema, error) {
 	name := cfg.name
 	// If the name is not provided as config then extract it from the struct type name.
 	if name == "" {
@@ -245,7 +246,7 @@ func schemaOfStruct(t reflect.Type, avroOpts []avro.SchemaOption, cfg *Config, c
 			}
 			if ft.Kind() == reflect.Struct {
 				// resolve the schema of the nested struct using the same default as the parent
-				anonymousSchema, err := schemaOf(ft, childOpt, func(sc *Config) {
+				anonymousSchema, err := schemaOf(ft, childOpt, func(sc *schemaConfig) {
 					sc.def = cfg.def
 					sc.acc = cfg.acc
 					sc.cache = cfg.cache
@@ -338,7 +339,7 @@ func schemaOfStruct(t reflect.Type, avroOpts []avro.SchemaOption, cfg *Config, c
 
 		// resolve the field schema
 		if fieldSchema == nil {
-			fieldSchema, err = schemaOf(f.Type, childOpt, func(sc *Config) {
+			fieldSchema, err = schemaOf(f.Type, childOpt, func(sc *schemaConfig) {
 				// resolve field-type aliases from a blank field defined at the field
 				// struct level (distinct from direct field-name aliases).
 				if typeAliases := structTypeAliases(cfg.tagKey, f.Type, nil); len(typeAliases) > 0 {
@@ -377,13 +378,23 @@ func schemaOfStruct(t reflect.Type, avroOpts []avro.SchemaOption, cfg *Config, c
 			avroFieldOpts = append(avroFieldOpts, avro.WithAliases(aliases))
 		}
 
-		tagPayload := sensitive.ParseTag(f.Tag)
-		if tagPayload != nil {
+		annotate := cfg.annotate
+		if annotate == nil {
+			annotate = SensitiveTags
+		}
+		ann, err := annotate(f)
+		if err != nil {
+			return nil, fmt.Errorf("%w: field %s.%s: %w", ErrInvalidTag, fullName, f.Name, err)
+		}
+		if ann != nil {
+			if ann.Property == "" {
+				return nil, fmt.Errorf("%w: field %s.%s: annotation has no property name", ErrInvalidTag, fullName, f.Name)
+			}
 			avroFieldOpts = append(avroFieldOpts, avro.WithProps(map[string]any{
-				"sensitive": tagPayload,
+				ann.Property: ann.Value,
 			}))
 			if cfg.acc != nil {
-				cfg.acc.appendSensitive(f.Type.Name() + "." + f.Name + "." + tagPayload.Marshal())
+				cfg.acc.appendSensitive(ann.Token)
 			}
 		}
 		field, err := avro.NewField(fieldName, fieldSchema, avroFieldOpts...)
@@ -421,7 +432,7 @@ func schemaOfStruct(t reflect.Type, avroOpts []avro.SchemaOption, cfg *Config, c
 }
 
 // deduplicateType replaces a type (or subtype) with a ref if it already exists in the cache.
-func deduplicateType(cache Cache, schema avro.Schema) avro.Schema {
+func deduplicateType(cache schemaCache, schema avro.Schema) avro.Schema {
 	if schema.Type() == avro.Ref {
 		return schema
 	}

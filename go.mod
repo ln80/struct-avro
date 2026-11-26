@@ -4,7 +4,8 @@ go 1.25.0
 
 require (
 	github.com/ln80/avro/v2 v2.33.1
-	github.com/ln80/struct-sensitive v0.7.0
+	github.com/ln80/struct-sensitive v0.9.0
+	golang.org/x/tools v0.45.0
 )
 
 require (
@@ -18,9 +19,7 @@ require (
 	github.com/modern-go/concurrent v0.0.0-20180306012644-bacd9c7ef1dd // indirect
 	github.com/modern-go/reflect2 v1.0.2 // indirect
 	github.com/pmezard/go-difflib v1.0.1-0.20181226105442-5d4384ee4fb2 // indirect
-	github.com/sanity-io/litter v1.5.8 // indirect
 	github.com/stretchr/testify v1.11.1 // indirect
 	golang.org/x/mod v0.36.0 // indirect
 	golang.org/x/sync v0.20.0 // indirect
-	golang.org/x/tools v0.45.0 // indirect
 )

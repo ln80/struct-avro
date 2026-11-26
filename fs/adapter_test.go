@@ -2,14 +2,18 @@ package fs
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
 	avro "github.com/ln80/avro/v2"
 	"github.com/ln80/struct-avro/registry"
+	"github.com/ln80/struct-avro/registrytest"
 )
 
 func TestWireFormatterRoundTrip(t *testing.T) {
@@ -165,9 +169,9 @@ func writeSchema(t *testing.T, dir, namespace, filename, body string) {
 
 func TestWalk_LatestIsNumericMax_CrossingTen(t *testing.T) {
 	dir := t.TempDir()
-	writeSchema(t, dir, "ns", "9@a.json", minimalRecord)
-	writeSchema(t, dir, "ns", "10@b.json", minimalRecord)
-	writeSchema(t, dir, "ns", "12@c.json", minimalRecord)
+	writeSchema(t, dir, "ns", "9@aaaaaaaaaaaaaaaa.json", minimalRecord)
+	writeSchema(t, dir, "ns", "10@bbbbbbbbbbbbbbbb.json", minimalRecord)
+	writeSchema(t, dir, "ns", "12@cccccccccccccccc.json", minimalRecord)
 
 	adapter := NewDirAdapter(dir)
 	seen := map[int64]bool{}
@@ -199,7 +203,7 @@ func TestWalk_LatestIsNumericMax_CrossingTen(t *testing.T) {
 
 func TestWalk_LatestAmongSingleDigitVersions(t *testing.T) {
 	dir := t.TempDir()
-	for _, name := range []string{"1@a.json", "5@b.json", "9@c.json"} {
+	for _, name := range []string{"1@aaaaaaaaaaaaaaaa.json", "5@bbbbbbbbbbbbbbbb.json", "9@cccccccccccccccc.json"} {
 		writeSchema(t, dir, "ns", name, minimalRecord)
 	}
 
@@ -221,24 +225,24 @@ func TestWalk_LatestAmongSingleDigitVersions(t *testing.T) {
 
 func TestPersist_NextVersionIsNumericMaxPlusOne(t *testing.T) {
 	dir := t.TempDir()
-	writeSchema(t, dir, "bank", "9@a.json", recV1)
-	writeSchema(t, dir, "bank", "10@b.json", recV1)
+	writeSchema(t, dir, "bank", "9@aaaaaaaaaaaaaaaa.json", recV1)
+	writeSchema(t, dir, "bank", "10@bbbbbbbbbbbbbbbb.json", recV1)
 
 	a := NewDirAdapter(dir)
 	id, err := a.Persist(context.Background(), avro.MustParse(recV2).(*avro.RecordSchema))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Stat(filepath.Join(dir, "bank", "11@"+id+".json")); err != nil {
+	if _, err := os.Stat(filepath.Join(dir, "bank", "0011@"+id+".json")); err != nil {
 		t.Fatalf("expected version 11 to be persisted: %v", err)
 	}
 }
 
 func TestMaxVersionAmong(t *testing.T) {
 	max, err := maxVersionAmong([]string{
-		"ns/9@a.json",
-		"ns/10@b.json",
-		"ns/12@c.json",
+		"ns/9@aaaaaaaaaaaaaaaa.json",
+		"ns/10@bbbbbbbbbbbbbbbb.json",
+		"ns/12@cccccccccccccccc.json",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -258,4 +262,190 @@ func slicesEqual(a, b []int64) bool {
 		}
 	}
 	return true
+}
+
+func TestGet_RejectsInvalidID(t *testing.T) {
+	dir := t.TempDir()
+	writeSchema(t, dir, "ns", "1@aaaaaaaaaaaaaaaa.json", minimalRecord)
+	adapter := NewDirAdapter(dir)
+
+	// '*' and '?' would match another schema's file if used in the glob pattern.
+	for _, id := range []string{"****************", "????????????????", "[a]aaaaaaaaaaaaa", "AAAAAAAAAAAAAAAA", "short", ""} {
+		if _, err := adapter.Get(context.Background(), id); !errors.Is(err, registry.ErrInvalidSchemaID) {
+			t.Fatalf("id %q: expect ErrInvalidSchemaID, got %v", id, err)
+		}
+	}
+	if _, err := adapter.Get(context.Background(), "aaaaaaaaaaaaaaaa"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestExtractSchemaID_RejectsNonHexPrefix(t *testing.T) {
+	wf := NewWireFormatter()
+	if _, _, err := wf.ExtractSchemaID([]byte("****************payload")); !errors.Is(err, registry.ErrInvalidDataWireFormat) {
+		t.Fatalf("expect ErrInvalidDataWireFormat, got %v", err)
+	}
+}
+
+func TestWalk_RejectsInvalidSchemaFiles(t *testing.T) {
+	cases := map[string]struct{ name, body string }{
+		"not a record": {"1@aaaaaaaaaaaaaaaa.json", `"string"`},
+		"not json":     {"1@aaaaaaaaaaaaaaaa.json", `{`},
+		"bad id":       {"1@zzzzzzzzzzzzzzzz.json", minimalRecord},
+		"zero version": {"0@aaaaaaaaaaaaaaaa.json", minimalRecord},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			writeSchema(t, dir, "ns", tc.name, tc.body)
+			_, err := NewDirAdapter(dir).Walk(context.Background(), func(string, int64, bool, *avro.RecordSchema) error { return nil })
+			if err == nil {
+				t.Fatal("expect error")
+			}
+		})
+	}
+}
+
+func TestPersist_SameVersionTwiceIsIdempotent(t *testing.T) {
+	dir := t.TempDir()
+	a := NewDirAdapter(dir)
+	s := avro.MustParse(recV1).(*avro.RecordSchema)
+	fixed := func(pc *registry.PersistConfig) {
+		pc.Resolver = func(*avro.RecordSchema) (string, int, error) { return "aaaaaaaaaaaaaaaa", 3, nil }
+	}
+	for i := 0; i < 2; i++ {
+		if _, err := a.Persist(context.Background(), s, fixed); err != nil {
+			t.Fatalf("persist %d: %v", i, err)
+		}
+	}
+
+	// Same version and ID, different schema: refused, file kept.
+	if _, err := a.Persist(context.Background(), avro.MustParse(recV2).(*avro.RecordSchema), fixed); !errors.Is(err, registry.ErrCreateOrUpdateSchemaFailed) {
+		t.Fatalf("expect ErrCreateOrUpdateSchemaFailed, got %v", err)
+	}
+	// Same version, other ID: refused.
+	other := func(pc *registry.PersistConfig) {
+		pc.Resolver = func(*avro.RecordSchema) (string, int, error) { return "bbbbbbbbbbbbbbbb", 3, nil }
+	}
+	if _, err := a.Persist(context.Background(), s, other); !errors.Is(err, registry.ErrCreateOrUpdateSchemaFailed) {
+		t.Fatalf("expect ErrCreateOrUpdateSchemaFailed, got %v", err)
+	}
+	got, err := a.Get(context.Background(), "aaaaaaaaaaaaaaaa")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(got, `"ID"`) || strings.Contains(got, `"At"`) {
+		t.Fatalf("stored schema was overwritten: %s", got)
+	}
+}
+
+func TestAdapterConformance(t *testing.T) {
+	registrytest.Run(t, func(t *testing.T) registrytest.Store {
+		return NewDirAdapter(t.TempDir())
+	})
+}
+
+func TestPersist_FileNamesSortInVersionOrder(t *testing.T) {
+	dir := t.TempDir()
+	a := NewDirAdapter(dir)
+	for v := 1; v <= 12; v++ {
+		body := `{"type":"record","name":"events","namespace":"bank","fields":[{"name":"F` + strconv.Itoa(v) + `","type":"string","default":""}]}`
+		if _, err := a.Persist(context.Background(), avro.MustParse(body).(*avro.RecordSchema)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	entries, err := os.ReadDir(filepath.Join(dir, "bank"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// os.ReadDir sorts by name: that order must be the version order.
+	for i, e := range entries {
+		want := fmt.Sprintf("%04d@", i+1)
+		if !strings.HasPrefix(e.Name(), want) {
+			t.Fatalf("entry %d is %s, want prefix %s", i, e.Name(), want)
+		}
+	}
+}
+
+func TestPersist_RenamesLegacyUnpaddedFile(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	a := NewDirAdapter(dir)
+	s := avro.MustParse(recV1).(*avro.RecordSchema)
+	fp, _ := s.FingerprintUsing(avro.CRC64Avro)
+	id := hex.EncodeToString(fp)
+	b, _ := s.MarshalJSON()
+	writeSchema(t, dir, "bank", "7@"+id+".json", string(b))
+
+	// Persisting the stored schema again keeps version 7 and pads the name.
+	got, err := a.Persist(ctx, s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != id {
+		t.Fatalf("id: want %s, got %s", id, got)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "bank", "0007@"+id+".json")); err != nil {
+		t.Fatalf("legacy file not renamed: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "bank", "7@"+id+".json")); !os.IsNotExist(err) {
+		t.Fatalf("legacy file must be gone, got %v", err)
+	}
+
+	// The next version follows the legacy numbering.
+	if _, err := a.Persist(ctx, avro.MustParse(recV2).(*avro.RecordSchema)); err != nil {
+		t.Fatal(err)
+	}
+	matches, _ := filepath.Glob(filepath.Join(dir, "bank", "0008@*.json"))
+	if len(matches) != 1 {
+		t.Fatalf("expect version 0008, got %v", matches)
+	}
+}
+
+func TestPersist_LegacyFileWithOtherSchemaIsNotRenamed(t *testing.T) {
+	dir := t.TempDir()
+	a := NewDirAdapter(dir)
+	s := avro.MustParse(recV1).(*avro.RecordSchema)
+	fp, _ := s.FingerprintUsing(avro.CRC64Avro)
+	id := hex.EncodeToString(fp)
+	writeSchema(t, dir, "bank", "7@"+id+".json", recV2) // tampered content
+	fixed := func(pc *registry.PersistConfig) {
+		pc.Resolver = func(*avro.RecordSchema) (string, int, error) { return id, 7, nil }
+	}
+	if _, err := a.Persist(context.Background(), s, fixed); !errors.Is(err, registry.ErrCreateOrUpdateSchemaFailed) {
+		t.Fatalf("expect ErrCreateOrUpdateSchemaFailed, got %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "bank", "7@"+id+".json")); err != nil {
+		t.Fatalf("file must be kept: %v", err)
+	}
+}
+
+func TestPersist_VersionConflictAcrossNameFormats(t *testing.T) {
+	dir := t.TempDir()
+	writeSchema(t, dir, "bank", "3@aaaaaaaaaaaaaaaa.json", recV1)
+	fixed := func(pc *registry.PersistConfig) {
+		pc.Resolver = func(*avro.RecordSchema) (string, int, error) { return "bbbbbbbbbbbbbbbb", 3, nil }
+	}
+	_, err := NewDirAdapter(dir).Persist(context.Background(), avro.MustParse(recV1).(*avro.RecordSchema), fixed)
+	if !errors.Is(err, registry.ErrCreateOrUpdateSchemaFailed) {
+		t.Fatalf("expect a conflict with the unpadded version 3, got %v", err)
+	}
+}
+
+func TestParseSchemaPath_Versions(t *testing.T) {
+	for path, want := range map[string]int64{
+		"ns/1@aaaaaaaaaaaaaaaa.json":     1,
+		"ns/0001@aaaaaaaaaaaaaaaa.json":  1,
+		"ns/12345@aaaaaaaaaaaaaaaa.json": 12345,
+	} {
+		v, _, _, err := parseSchemaPath(path)
+		if err != nil || v != want {
+			t.Fatalf("%s: got %d, %v", path, v, err)
+		}
+	}
+	for _, path := range []string{"ns/+1@aaaaaaaaaaaaaaaa.json", "ns/ 1@aaaaaaaaaaaaaaaa.json", "ns/0000@aaaaaaaaaaaaaaaa.json", "ns/@aaaaaaaaaaaaaaaa.json"} {
+		if _, _, _, err := parseSchemaPath(path); err == nil {
+			t.Fatalf("%s: expect error", path)
+		}
+	}
 }
