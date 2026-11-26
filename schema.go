@@ -8,11 +8,16 @@ import (
 	"time"
 
 	avro "github.com/ln80/avro/v2"
-	sensitive "github.com/ln80/struct-sensitive"
 )
 
-// ErrInvalidTag is returned when a struct field carries a tag that cannot be parsed.
-var ErrInvalidTag = errors.New("invalid struct tag")
+var (
+	// ErrInvalidTag is returned when a struct field carries a tag that cannot
+	// be parsed, or that its FieldAnnotator rejects.
+	ErrInvalidTag = errors.New("invalid struct tag")
+	// ErrInvalidConfig is returned for an option or configuration value that
+	// cannot be used.
+	ErrInvalidConfig = errors.New("invalid configuration")
+)
 
 // Cache deduplicates named (record) schemas while walking a struct tree, so that a
 // type referenced more than once is emitted once and referenced via a RefSchema.
@@ -46,6 +51,8 @@ type Config struct {
 	// acc accumulates defaults/sensitive metadata while walking, to emit the
 	// envelope-level fingerprint fields.
 	acc *Accumulator
+	// annotate returns the annotation of each struct field. nil means SensitiveTags.
+	annotate FieldAnnotator
 }
 
 // Option configures a SchemaOf call.
@@ -60,6 +67,10 @@ func WithAccumulator(a *Accumulator) Option { return func(c *Config) { c.acc = a
 func WithEvent(isEvent bool) Option         { return func(c *Config) { c.isEvent = isEvent } }
 func WithRoot(root bool) Option             { return func(c *Config) { c.root = root } }
 func WithTagKey(key string) Option          { return func(c *Config) { c.tagKey = key } }
+
+// WithFieldAnnotator sets how struct fields are annotated. The default is
+// SensitiveTags; NoAnnotations turns annotations off.
+func WithFieldAnnotator(fn FieldAnnotator) Option { return func(c *Config) { c.annotate = fn } }
 
 // WithInject substitutes the given schema for fields tagged `ev:",inject=<key>"`.
 func WithInject(key string, schema avro.Schema) Option {
@@ -104,6 +115,7 @@ func schemaOf(t reflect.Type, opts ...func(*Config)) (avro.Schema, error) {
 		sc.cache = cfg.cache
 		sc.root = false
 		sc.acc = cfg.acc
+		sc.annotate = cfg.annotate
 	}
 
 	avroOpts := make([]avro.SchemaOption, 0)
@@ -380,16 +392,23 @@ func schemaOfStruct(t reflect.Type, avroOpts []avro.SchemaOption, cfg *Config, c
 			avroFieldOpts = append(avroFieldOpts, avro.WithAliases(aliases))
 		}
 
-		tagPayload, err := sensitive.ParseTag(f.Tag)
+		annotate := cfg.annotate
+		if annotate == nil {
+			annotate = SensitiveTags
+		}
+		ann, err := annotate(f)
 		if err != nil {
 			return nil, fmt.Errorf("%w: field %s.%s: %w", ErrInvalidTag, fullName, f.Name, err)
 		}
-		if tagPayload != nil {
+		if ann != nil {
+			if ann.Property == "" {
+				return nil, fmt.Errorf("%w: field %s.%s: annotation has no property name", ErrInvalidTag, fullName, f.Name)
+			}
 			avroFieldOpts = append(avroFieldOpts, avro.WithProps(map[string]any{
-				"sensitive": tagPayload,
+				ann.Property: ann.Value,
 			}))
 			if cfg.acc != nil {
-				cfg.acc.appendSensitive(f.Type.Name() + "." + f.Name + "." + tagPayload.Marshal())
+				cfg.acc.appendSensitive(ann.Token)
 			}
 		}
 		field, err := avro.NewField(fieldName, fieldSchema, avroFieldOpts...)

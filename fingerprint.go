@@ -22,10 +22,14 @@ import (
 type Accumulator struct {
 	def       []byte
 	sensitive []string
+	names     FingerprintFields
 }
 
-// NewAccumulator returns an empty accumulator, shared across the SchemaOf calls of one envelope.
-func NewAccumulator() *Accumulator { return &Accumulator{} }
+// NewAccumulator returns an empty accumulator, shared across the SchemaOf calls
+// of one envelope. It names its fields with the legacy prefixes.
+func NewAccumulator() *Accumulator {
+	return &Accumulator{names: FingerprintFields{Defaults: LegacyDefaultsPrefix, Annotations: LegacyAnnotationsPrefix}}
+}
 
 func (a *Accumulator) appendDefault(def any) {
 	if m, ok := def.(map[string]any); ok {
@@ -57,7 +61,7 @@ func (a *Accumulator) defaultField() *avro.Field {
 
 	hash := sha3.Sum256(vv)
 	fingerprint := hex.EncodeToString(hash[:])
-	f, _ := avro.NewField("defxyz"+fingerprint, avro.NewPrimitiveSchema(avro.String, nil), avro.WithDefault(""))
+	f, _ := avro.NewField(a.names.Defaults+fingerprint, avro.NewPrimitiveSchema(avro.String, nil), avro.WithDefault(""))
 	return f
 }
 
@@ -70,6 +74,6 @@ func (a *Accumulator) sensitiveField() *avro.Field {
 
 	hash := sha3.Sum256([]byte(strings.Join(vv, ".")))
 	fingerprint := hex.EncodeToString(hash[:])
-	f, _ := avro.NewField("sensitivexyz"+fingerprint, avro.NewPrimitiveSchema(avro.String, nil), avro.WithDefault(""))
+	f, _ := avro.NewField(a.names.Annotations+fingerprint, avro.NewPrimitiveSchema(avro.String, nil), avro.WithDefault(""))
 	return f
 }

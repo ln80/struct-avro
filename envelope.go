@@ -39,6 +39,12 @@ type EnvelopeConfig struct {
 	// Validate, when true, round-trips each record's defaults through the API to
 	// catch invalid generated defaults (mirrors event-store's eventSchema checks).
 	Validate bool
+	// Annotator returns the annotation of each struct field. nil means
+	// SensitiveTags; NoAnnotations turns annotations off.
+	Annotator FieldAnnotator
+	// Fingerprint names the fields that make a change to defaults or
+	// annotations change the schema ID. The zero value keeps the legacy names.
+	Fingerprint FingerprintFields
 }
 
 // BuildEnvelopeSchema assembles an envelope record schema: it generates one record
@@ -56,8 +62,13 @@ func BuildEnvelopeSchema(a avro.API, cfg EnvelopeConfig) (*avro.RecordSchema, er
 		tagKey = DefaultTagKey
 	}
 
+	names, err := cfg.Fingerprint.withDefaults()
+	if err != nil {
+		return nil, err
+	}
 	cache := NewCache()
 	acc := NewAccumulator()
+	acc.names = names
 
 	schemas := make([]avro.Schema, 0, len(cfg.Entries)+1)
 	for _, entry := range cfg.Entries {
@@ -81,6 +92,7 @@ func BuildEnvelopeSchema(a avro.API, cfg EnvelopeConfig) (*avro.RecordSchema, er
 			sc.isEvent = true
 			sc.acc = acc
 			sc.tagKey = tagKey
+			sc.annotate = cfg.Annotator
 		})
 		if err != nil {
 			return nil, fmt.Errorf("record '%s': %w", entry.Name, err)
@@ -122,6 +134,7 @@ func BuildEnvelopeSchema(a avro.API, cfg EnvelopeConfig) (*avro.RecordSchema, er
 		c.root = true
 		c.acc = acc
 		c.tagKey = tagKey
+		c.annotate = cfg.Annotator
 	})
 	if err != nil {
 		return nil, err

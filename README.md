@@ -306,8 +306,16 @@ Notes:
 - Field defaults come from the Go zero value unless `RecordEntry.Sample` (or
   `WithDefault`) supplies a richer sample.
 - Rename a field for readers with `` `ev:",aliases=OldName"` `` on the new field.
-- Changing a field default or a `pii` / sensitive annotation changes synthetic
-  fingerprint fields on the envelope, which changes the schema ID.
+- Changing a field default or a field annotation changes two synthetic
+  fingerprint fields on the envelope, which changes the schema ID. Avro's
+  canonical form, from which IDs are computed, drops defaults and properties.
+  The fields are named `defxyz<hash>` and `sensitivexyz<hash>` unless
+  `EnvelopeConfig.Fingerprint` sets other prefixes. Renaming them adds a schema
+  version; old data stays readable.
+- Field annotations default to the struct-sensitive tags (`sensitive`, `pii`,
+  `sens`), written to the `sensitive` Avro property. Set
+  `EnvelopeConfig.Annotator` (or `WithFieldAnnotator`) to read your own tags,
+  or `NoAnnotations` to turn them off. An invalid tag fails schema generation.
 - Integer / duration mappings in `schemaOfPrimitives` are intentionally frozen
   for wire compatibility with already-persisted data; do not change them without
   an explicit schema migration.
