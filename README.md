@@ -27,9 +27,8 @@ Go structs  →  SchemaOf / BuildEnvelopeSchema  →  Avro schema
                                                  Avro bytes
 ```
 
-Optional schema-id framing (`fs.WireFormatter` + `registry.Registry`) prefixes
-the schema ID onto those bytes so a reader can look up the writer schema and
-resolve it against the current reader schema.
+The optional `registry` package prefixes the schema ID onto those bytes, so a
+reader can look up the writer schema and resolve it against its current schema.
 
 `api.Register(fullName, value)` (register both the value and a pointer) is
 needed only when the payload is a **union**: without it, Avro decodes unknown
@@ -180,12 +179,12 @@ func main() {
 }
 ```
 
-## Schema ID framing (optional)
+## Schema registry (optional)
 
-After marshal, prefix the schema ID. Before unmarshal, extract it and resolve
-the schema through the registry. `GetSchema` resolves an older writer schema
-against the current reader schema when `Setup` has installed one. That is the
-rest of the old event-store serializer (minus `event.Envelope`).
+`registry.Open` reads schemas from a store, frames the schema ID into each
+payload, and resolves data written with an older schema against the current
+one. A store implements `registry.Fetcher`, and optionally `Persister`,
+`Walker` and `WireFormatter`; `fs.Adapter` implements all four.
 
 ```go
 import (
@@ -193,17 +192,27 @@ import (
 	"github.com/ln80/struct-avro/registry"
 )
 
-wf := fs.NewWireFormatter()
-framed, err := wf.AppendSchemaID(payload, schemaID)
+// Production: schemas embedded at build time by the tool package.
+reg, err := registry.Open(ctx, fs.NewAdapter(events.EmbedFS(), ""),
+	registry.WithAPI(api),          // the API your union types are registered on
+	registry.WithCurrent(schema),   // must already be in the store
+)
 
-id, raw, err := wf.ExtractSchemaID(framed)
-_, schema, _, err := reg.GetSchema(ctx, id)
-err = api.Unmarshal(schema, raw, &dest)
+b, err := reg.Encode(in)            // schema ID + Avro bytes
+id, err := reg.Decode(ctx, b, &out) // resolves the writer schema by ID
 ```
 
-Typical wiring: `fs.NewDirAdapter(dir)` as both `Fetcher` and `Persister`, then
-`registry.New(adapter, adapter, fs.NewWireFormatter())`, then
-`reg.Setup(ctx, currentSchema, …)`.
+| Option | Effect |
+|---|---|
+| `WithCurrent(s)` | Encode with `s`; decode older data into `s`. Open fails if the store does not have `s`. |
+| `WithReaderSchema(s)` | Decode into `s` without looking it up. `Encode` returns `ErrNoCurrentSchema`. |
+| `WithPersistCurrent()` | Persist the current schema if missing. Development only. |
+| `WithWireFormatter(wf)` | Frame IDs with `wf` instead of the store. |
+| no option | Decode with the writer schema; no encoding. |
+
+`EncodeBatch` and `DecodeBatch` encode a slice as one array payload.
+`EncodeWithID` writes a value again with the schema it was read with. The
+registry is safe for concurrent use.
 
 ## Tooling — generate, check, persist, embed
 

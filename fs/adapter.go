@@ -442,3 +442,16 @@ func NewWireFormatter() *WireFormatter {
 }
 
 var _ registry.WireFormatter = &WireFormatter{}
+
+// AppendSchemaID implements registry.WireFormatter with WireFormatter, so an
+// Adapter is a complete store for registry.Open.
+func (*Adapter) AppendSchemaID(data []byte, id string) ([]byte, error) {
+	return (&WireFormatter{}).AppendSchemaID(data, id)
+}
+
+// ExtractSchemaID implements registry.WireFormatter with WireFormatter.
+func (*Adapter) ExtractSchemaID(data []byte) (string, []byte, error) {
+	return (&WireFormatter{}).ExtractSchemaID(data)
+}
+
+var _ registry.WireFormatter = &Adapter{}
