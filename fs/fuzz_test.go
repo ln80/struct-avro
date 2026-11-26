@@ -30,7 +30,7 @@ func FuzzExtractSchemaID(f *testing.F) {
 
 // FuzzParseSchemaPath checks the parser of stored file names.
 func FuzzParseSchemaPath(f *testing.F) {
-	for _, s := range []string{"ns/1@0123456789abcdef.json", "a/b/12@ffffffffffffffff.json", "ns/0@x.json", "@", "ns/-1@0123456789abcdef.json", "ns/1@*.json"} {
+	for _, s := range []string{"ns/1@0123456789abcdef.json", "ns/0001@0123456789abcdef.json", "ns/+1@0123456789abcdef.json", "a/b/12@ffffffffffffffff.json", "ns/0@x.json", "@", "ns/-1@0123456789abcdef.json", "ns/1@*.json"} {
 		f.Add(s)
 	}
 	f.Fuzz(func(t *testing.T, path string) {

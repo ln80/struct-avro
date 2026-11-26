@@ -57,7 +57,20 @@ func validID(id string) bool {
 	return true
 }
 
-// parseSchemaPath extracts (version, namespace, id) from a "<ns>/<version>@<id>.json" path.
+// versionDigits is the width versions are zero-padded to in file names, so
+// that names sort in version order: 0009@… before 0010@…. A version above
+// 9999 is written with more digits and still read correctly; only the
+// listing order of such files is affected.
+const versionDigits = 4
+
+// schemaFileName returns the file name of a stored schema version.
+func schemaFileName(version int, id string) string {
+	return fmt.Sprintf("%0*d@%s.json", versionDigits, version, id)
+}
+
+// parseSchemaPath extracts (version, namespace, id) from a "<ns>/<version>@<id>.json"
+// path. The version may be zero-padded ("0007") or not ("7", written by
+// earlier versions of this package).
 func parseSchemaPath(path string) (version int64, namespace, id string, err error) {
 	splits := strings.Split(path, "/")
 	if len(splits) < 2 {
@@ -72,7 +85,11 @@ func parseSchemaPath(path string) (version int64, namespace, id string, err erro
 		err = fmt.Errorf("invalid schema path: '%s' missing version separator", path)
 		return
 	}
-	version, err = strconv.ParseInt(strings.TrimSpace(at[0]), 10, 64)
+	if at[0] == "" || len(at[0]) > 18 || strings.Trim(at[0], "0123456789") != "" {
+		err = fmt.Errorf("invalid schema path: '%s' version must be decimal digits", path)
+		return
+	}
+	version, err = strconv.ParseInt(at[0], 10, 64)
 	if err != nil {
 		err = fmt.Errorf("invalid schema path: '%s' bad version: %w", path, err)
 		return
@@ -194,18 +211,49 @@ func (p *Adapter) Persist(ctx context.Context, schema *avro.RecordSchema, opts .
 		return "", err
 	}
 
-	name := strconv.Itoa(version) + "@" + id + ".json"
-	taken, err := fs.Glob(os.DirFS(dir), strconv.Itoa(version)+"@*.json")
+	name := schemaFileName(version, id)
+	path := filepath.Clean(filepath.Join(dir, name))
+
+	// Look for this version under any file name: padded or, from older
+	// versions of this package, unpadded.
+	stored, err := fs.Glob(os.DirFS(dir), "*@*.json")
 	if err != nil {
 		return "", err
 	}
-	for _, other := range taken {
-		if other != name {
+	var sameVersion []string
+	for _, other := range stored {
+		v, _, otherID, err := parseSchemaPath(namespace + "/" + other)
+		if err != nil {
+			return "", fmt.Errorf("%w: %w", registry.ErrCreateOrUpdateSchemaFailed, err)
+		}
+		if v != int64(version) {
+			continue
+		}
+		if otherID != id {
 			return "", fmt.Errorf("%w: %s/%d is already stored as %s", registry.ErrCreateOrUpdateSchemaFailed, namespace, version, other)
 		}
+		sameVersion = append(sameVersion, other)
+	}
+	if len(sameVersion) > 1 {
+		return "", fmt.Errorf("%w: %s/%d is stored more than once", registry.ErrCreateOrUpdateSchemaFailed, namespace, version)
+	}
+	if len(sameVersion) == 1 && sameVersion[0] != name {
+		// Stored under an unpadded name. Rename it when it holds the same
+		// schema, so file names sort in version order.
+		legacy := filepath.Join(dir, sameVersion[0])
+		same, err := sameSchemaFile(legacy, b)
+		if err != nil {
+			return "", fmt.Errorf("%w: %w", registry.ErrCreateOrUpdateSchemaFailed, err)
+		}
+		if !same {
+			return "", fmt.Errorf("%w: %s holds a different schema", registry.ErrCreateOrUpdateSchemaFailed, sameVersion[0])
+		}
+		if err := os.Rename(legacy, path); err != nil {
+			return "", fmt.Errorf("%w: %w", registry.ErrCreateOrUpdateSchemaFailed, err)
+		}
+		return id, nil
 	}
 
-	path := filepath.Clean(filepath.Join(dir, name))
 	if err := writeNewFile(path, pretty.Bytes()); err != nil {
 		if !errors.Is(err, fs.ErrExist) {
 			return "", fmt.Errorf("%w: %w", registry.ErrCreateOrUpdateSchemaFailed, err)

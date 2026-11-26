@@ -170,7 +170,8 @@ func (e *JobExecuter) PersistSchemas(fetcher registry.Fetcher, persister registr
 
 // EmbedSchemas walks every persisted schema version and writes, under cfg.Out:
 //
-//   - <namespace>/<version>@<id>.json: a copy of each version;
+//   - <namespace>/<version>@<id>.json: a copy of each version, the version
+//     zero-padded to 4 digits (0001@…) so that names sort in version order;
 //   - <namespace>/events.go: Go types generated from the latest version;
 //   - embed.go: an EmbedFS function exposing the copies as an embed.FS.
 //
@@ -582,7 +583,7 @@ import "embed"
 var schemas embed.FS
 
 // EmbedFS returns every persisted schema version, stored as
-// <namespace>/<version>@<id>.json.
+// <namespace>/<version>@<id>.json, the version zero-padded (0001@…).
 func EmbedFS() embed.FS {
 	return schemas
 }

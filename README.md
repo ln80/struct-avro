@@ -89,7 +89,9 @@ err := tool.NewJobExecuter(nil).
 
 The job fails if the current schema cannot read every stored version. It
 writes `gen/events/<namespace>/<version>@<id>.json`, `<namespace>/events.go`
-and `embed.go`.
+and `embed.go`. Versions in file names are zero-padded (`0001@…`) so that a
+directory listing is in version order; unpadded names from earlier versions are
+read, and renamed when the tool copies them.
 
 ## Testing a store
 

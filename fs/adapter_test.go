@@ -2,9 +2,12 @@ package fs
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -230,7 +233,7 @@ func TestPersist_NextVersionIsNumericMaxPlusOne(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Stat(filepath.Join(dir, "bank", "11@"+id+".json")); err != nil {
+	if _, err := os.Stat(filepath.Join(dir, "bank", "0011@"+id+".json")); err != nil {
 		t.Fatalf("expected version 11 to be persisted: %v", err)
 	}
 }
@@ -340,4 +343,109 @@ func TestAdapterConformance(t *testing.T) {
 	registrytest.Run(t, func(t *testing.T) registrytest.Store {
 		return NewDirAdapter(t.TempDir())
 	})
+}
+
+func TestPersist_FileNamesSortInVersionOrder(t *testing.T) {
+	dir := t.TempDir()
+	a := NewDirAdapter(dir)
+	for v := 1; v <= 12; v++ {
+		body := `{"type":"record","name":"events","namespace":"bank","fields":[{"name":"F` + strconv.Itoa(v) + `","type":"string","default":""}]}`
+		if _, err := a.Persist(context.Background(), avro.MustParse(body).(*avro.RecordSchema)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	entries, err := os.ReadDir(filepath.Join(dir, "bank"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// os.ReadDir sorts by name: that order must be the version order.
+	for i, e := range entries {
+		want := fmt.Sprintf("%04d@", i+1)
+		if !strings.HasPrefix(e.Name(), want) {
+			t.Fatalf("entry %d is %s, want prefix %s", i, e.Name(), want)
+		}
+	}
+}
+
+func TestPersist_RenamesLegacyUnpaddedFile(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	a := NewDirAdapter(dir)
+	s := avro.MustParse(recV1).(*avro.RecordSchema)
+	fp, _ := s.FingerprintUsing(avro.CRC64Avro)
+	id := hex.EncodeToString(fp)
+	b, _ := s.MarshalJSON()
+	writeSchema(t, dir, "bank", "7@"+id+".json", string(b))
+
+	// Persisting the stored schema again keeps version 7 and pads the name.
+	got, err := a.Persist(ctx, s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != id {
+		t.Fatalf("id: want %s, got %s", id, got)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "bank", "0007@"+id+".json")); err != nil {
+		t.Fatalf("legacy file not renamed: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "bank", "7@"+id+".json")); !os.IsNotExist(err) {
+		t.Fatalf("legacy file must be gone, got %v", err)
+	}
+
+	// The next version follows the legacy numbering.
+	if _, err := a.Persist(ctx, avro.MustParse(recV2).(*avro.RecordSchema)); err != nil {
+		t.Fatal(err)
+	}
+	matches, _ := filepath.Glob(filepath.Join(dir, "bank", "0008@*.json"))
+	if len(matches) != 1 {
+		t.Fatalf("expect version 0008, got %v", matches)
+	}
+}
+
+func TestPersist_LegacyFileWithOtherSchemaIsNotRenamed(t *testing.T) {
+	dir := t.TempDir()
+	a := NewDirAdapter(dir)
+	s := avro.MustParse(recV1).(*avro.RecordSchema)
+	fp, _ := s.FingerprintUsing(avro.CRC64Avro)
+	id := hex.EncodeToString(fp)
+	writeSchema(t, dir, "bank", "7@"+id+".json", recV2) // tampered content
+	fixed := func(pc *registry.PersistConfig) {
+		pc.Resolver = func(*avro.RecordSchema) (string, int, error) { return id, 7, nil }
+	}
+	if _, err := a.Persist(context.Background(), s, fixed); !errors.Is(err, registry.ErrCreateOrUpdateSchemaFailed) {
+		t.Fatalf("expect ErrCreateOrUpdateSchemaFailed, got %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "bank", "7@"+id+".json")); err != nil {
+		t.Fatalf("file must be kept: %v", err)
+	}
+}
+
+func TestPersist_VersionConflictAcrossNameFormats(t *testing.T) {
+	dir := t.TempDir()
+	writeSchema(t, dir, "bank", "3@aaaaaaaaaaaaaaaa.json", recV1)
+	fixed := func(pc *registry.PersistConfig) {
+		pc.Resolver = func(*avro.RecordSchema) (string, int, error) { return "bbbbbbbbbbbbbbbb", 3, nil }
+	}
+	_, err := NewDirAdapter(dir).Persist(context.Background(), avro.MustParse(recV1).(*avro.RecordSchema), fixed)
+	if !errors.Is(err, registry.ErrCreateOrUpdateSchemaFailed) {
+		t.Fatalf("expect a conflict with the unpadded version 3, got %v", err)
+	}
+}
+
+func TestParseSchemaPath_Versions(t *testing.T) {
+	for path, want := range map[string]int64{
+		"ns/1@aaaaaaaaaaaaaaaa.json":     1,
+		"ns/0001@aaaaaaaaaaaaaaaa.json":  1,
+		"ns/12345@aaaaaaaaaaaaaaaa.json": 12345,
+	} {
+		v, _, _, err := parseSchemaPath(path)
+		if err != nil || v != want {
+			t.Fatalf("%s: got %d, %v", path, v, err)
+		}
+	}
+	for _, path := range []string{"ns/+1@aaaaaaaaaaaaaaaa.json", "ns/ 1@aaaaaaaaaaaaaaaa.json", "ns/0000@aaaaaaaaaaaaaaaa.json", "ns/@aaaaaaaaaaaaaaaa.json"} {
+		if _, _, _, err := parseSchemaPath(path); err == nil {
+			t.Fatalf("%s: expect error", path)
+		}
+	}
 }

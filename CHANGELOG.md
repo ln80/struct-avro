@@ -7,7 +7,7 @@ framed payloads do not change between versions unless an entry says so.
 ## Unreleased
 
 Breaking. Schemas generated for the same types are unchanged: same bytes,
-same IDs.
+same IDs. Stored file names change (see below).
 
 ### Changed
 
@@ -28,6 +28,11 @@ same IDs.
 - `BuildEnvelopeSchema` registers the record entries on the API.
 - `NewAPI` bounds decoder allocations; see `WithMaxSliceAllocSize` and
   `WithMaxByteSliceSize`.
+- **File names.** `fs.Adapter` writes `<namespace>/0001@<id>.json`: the
+  version is zero-padded to 4 digits so that names sort in version order.
+  Unpadded names (`1@<id>.json`) are still read. Persisting a stored version
+  again, which `EmbedSchemas` does, renames its unpadded file after checking
+  that it holds the same schema. Schema IDs and contents do not change.
 - `fs.Adapter` validates schema IDs (16 lowercase hex characters) and file
   names, never overwrites a stored version, and returns the existing ID when a
   stored schema is persisted again.

@@ -135,7 +135,7 @@ func assertGeneratedLayout(t *testing.T, out, namespace, id string) {
 			t.Fatalf("%s: first line is %q", name, first)
 		}
 	}
-	if _, err := os.Stat(filepath.Join(out, namespace, "1@"+id+".json")); err != nil {
+	if _, err := os.Stat(filepath.Join(out, namespace, "0001@"+id+".json")); err != nil {
 		t.Fatalf("schema version not copied to the output: %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(out, "init.go")); !os.IsNotExist(err) {
@@ -342,4 +342,36 @@ var _ embed.FS
 	if !strings.Contains(string(b), want) {
 		t.Fatalf("imports not grouped:\n%s", b)
 	}
+}
+
+// TestEmbedSchemasPadsLegacyNamesInPlace mirrors a store written by an older
+// version, with unpadded file names, that is also the output directory.
+func TestEmbedSchemasPadsLegacyNamesInPlace(t *testing.T) {
+	root := t.TempDir()
+	out := filepath.Join(root, "events")
+	body := bankV1Schema(t).String()
+	for v, id := range map[string]string{"1": "aaaaaaaaaaaaaaaa", "9": "bbbbbbbbbbbbbbbb", "10": "cccccccccccccccc"} {
+		writeStoreSchema(t, out, "bank", v+"@"+id+".json", body)
+	}
+	if err := tool.NewJobExecuter(nil).EmbedSchemas(fs.NewDirAdapter(out), tool.EmbedConfig{Out: out}).Execute(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := os.ReadDir(filepath.Join(out, "bank"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	for _, e := range entries {
+		names = append(names, e.Name())
+	}
+	want := []string{"0001@", "0009@", "0010@", "events.go"}
+	if len(names) != len(want) {
+		t.Fatalf("files: %v", names)
+	}
+	for i, w := range want {
+		if !strings.HasPrefix(names[i], w) {
+			t.Fatalf("files: %v", names)
+		}
+	}
+	compileGenerated(t, root, out)
 }
