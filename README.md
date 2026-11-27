@@ -21,7 +21,7 @@ Encoding uses [`github.com/ln80/avro/v2`](https://github.com/ln80/avro).
 go get github.com/ln80/struct-avro
 ```
 
-Go 1.25 or later.
+Go 1.26 or later.
 
 ## Usage
 
