@@ -4,7 +4,7 @@ All notable changes. The API follows [semantic versioning](https://semver.org).
 Generated schemas, schema IDs, the file store layout and the wire format of
 framed payloads do not change between versions unless an entry says so.
 
-## Unreleased
+## v0.2.1
 
 ### Changed
 
