@@ -4,6 +4,12 @@ All notable changes. The API follows [semantic versioning](https://semver.org).
 Generated schemas, schema IDs, the file store layout and the wire format of
 framed payloads do not change between versions unless an entry says so.
 
+## Unreleased
+
+### Changed
+
+- Go 1.26 or later; CI tests on Go 1.26 and 1.27. Go 1.25 is out of support.
+
 ## v0.2.0
 
 Breaking. Schemas generated for the same types are unchanged: same bytes,
